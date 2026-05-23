@@ -5,3 +5,5 @@ dist/
 tests/build/
 .local/
 *.egg-info/
+AGENTS.md
+AGENTS.md
