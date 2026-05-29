@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
+import pty
 import re
+import select
 import shutil
 import subprocess
 import sys
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -12,11 +14,14 @@ from typing import Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 CASES_DIR = ROOT / "tests" / "cases"
+GOLDEN_DIR = ROOT / "tests" / "golden"
 BUILD_DIR = ROOT / "tests" / "build"
 LC3TOOLS_DIR = ROOT / "lc3tools"
 COMPILER_CMD = [sys.executable, "-m", "compiler_lc3"]
 LC3AS = LC3TOOLS_DIR / "lc3as"
-SIM_WRAP = ["script", "-q", "-c", "./lc3sim", "/dev/null"]
+LC3SIM = LC3TOOLS_DIR / "lc3sim"
+
+IS_CI = os.environ.get("CI", "").lower() in ("true", "1", "yes")
 
 
 @dataclass
@@ -61,7 +66,7 @@ class TestFailure(RuntimeError):
     pass
 
 
-def run(cmd: list[str], *, cwd: Path, input_text: str | None = None) -> str:
+def run(cmd: list[str], *, cwd: Path, input_text: str | None = None, timeout: int = 30) -> str:
     env = dict(os.environ)
     env["PATH"] = f"{ROOT / '.local' / 'bin'}:{env.get('PATH', '')}"
     proc = subprocess.run(
@@ -71,6 +76,7 @@ def run(cmd: list[str], *, cwd: Path, input_text: str | None = None) -> str:
         text=True,
         capture_output=True,
         env=env,
+        timeout=timeout,
         check=False,
     )
     if proc.returncode != 0:
@@ -80,12 +86,84 @@ def run(cmd: list[str], *, cwd: Path, input_text: str | None = None) -> str:
     return proc.stdout + proc.stderr
 
 
-def compile_case(case: Case) -> tuple[Path, Path]:
+def compile_to_asm(source: Path, output: Path, extra_flags: list[str] | None = None) -> str:
+    """Compile a .c source to .asm; return the generated text."""
+    cmd = COMPILER_CMD + [str(source), "-o", str(output)]
+    if extra_flags:
+        cmd.extend(extra_flags)
+    run(cmd, cwd=ROOT)
+    return output.read_text(encoding="utf-8")
+
+
+def _diff_golden(label: str, generated: str, golden_path: Path) -> None:
+    """Compare generated text against a golden file; raise TestFailure on mismatch."""
+    if not golden_path.exists():
+        raise TestFailure(
+            f"{label}: golden file missing: {golden_path}\n"
+            f"Run locally to regenerate golden files."
+        )
+    expected = golden_path.read_text(encoding="utf-8")
+    if generated == expected:
+        return
+    gen_lines = generated.splitlines()
+    exp_lines = expected.splitlines()
+    for i, (g, e) in enumerate(zip(gen_lines, exp_lines), start=1):
+        if g != e:
+            raise TestFailure(
+                f"{label}: output differs from golden at line {i}\n"
+                f"  expected: {e}\n"
+                f"  got:      {g}"
+            )
+    shorter = min(len(gen_lines), len(exp_lines))
+    if len(gen_lines) > len(exp_lines):
+        raise TestFailure(
+            f"{label}: extra lines after golden EOF at line {shorter + 1}\n"
+            f"  first extra: {gen_lines[shorter]}"
+        )
+    raise TestFailure(
+        f"{label}: missing lines after generated EOF at line {shorter + 1}\n"
+        f"  first missing: {exp_lines[shorter]}"
+    )
+
+
+def run_golden_tests() -> list[str]:
+    """Compile every case and diff against golden files. Returns failure descriptions."""
+    failures: list[str] = []
+    compiled: list[str] = []
+
+    def _check(label: str, source: Path, golden: Path,
+               extra_flags: list[str] | None = None) -> None:
+        tmp = BUILD_DIR / golden.name
+        try:
+            generated = compile_to_asm(source, tmp, extra_flags)
+            _diff_golden(label, generated, golden)
+            compiled.append(label)
+        except TestFailure as exc:
+            failures.append(str(exc))
+
+    for case in CASES:
+        _check(case.source, CASES_DIR / case.source,
+               GOLDEN_DIR / Path(case.source).with_suffix(".asm").name)
+
+    for case in BEG_CASES:
+        _check(f"[beginner] {case.source}", CASES_DIR / case.source,
+               GOLDEN_DIR / Path(case.source).with_suffix(".asm").name,
+               extra_flags=["--beginner-style"])
+
+    for label in compiled:
+        print(f"  GOLDEN OK  {label}")
+    return failures
+
+
+def compile_case(case: Case, extra_flags: list[str] | None = None) -> tuple[Path, Path]:
     source = CASES_DIR / case.source
     asm = BUILD_DIR / source.with_suffix(".asm").name
     obj = BUILD_DIR / source.with_suffix(".obj").name
 
-    run(COMPILER_CMD + [str(source), "-o", str(asm)], cwd=ROOT)
+    cmd = COMPILER_CMD + [str(source), "-o", str(asm)]
+    if extra_flags:
+        cmd.extend(extra_flags)
+    run(cmd, cwd=ROOT)
     run([str(LC3AS), str(asm.with_suffix(""))], cwd=LC3TOOLS_DIR)
 
     generated_obj = asm.with_suffix(".obj")
@@ -148,8 +226,23 @@ def verify_beginner_style_stack_case_runs() -> None:
     ensure_output_contains(output, "6\n")
 
 
-def simulate(obj: Path, *, commands: str) -> str:
-    return run(SIM_WRAP, cwd=LC3TOOLS_DIR, input_text=commands)
+def _simulate_tty(obj: Path, *, commands: str, timeout: int = 15) -> str:
+    """Run lc3sim through script(1) to provide a pty for GETC.
+    The sleep in the writer keeps the pipe open so script doesn't see
+    EOF before lc3sim finishes.  Output is returned as soon as the
+    script subprocess exits (when lc3sim processes "quit")."""
+    cmds = f"option flush off\\n{commands}".replace("\n", "\\n")
+    cmd_str = (
+        f'(printf "{cmds}"; sleep {timeout})'
+        f' | timeout {timeout} script -q -c "./lc3sim" /dev/null'
+    )
+    return run(["bash", "-c", cmd_str], cwd=LC3TOOLS_DIR, timeout=timeout + 5)
+
+
+def simulate(obj: Path, *, commands: str, needs_tty: bool = False) -> str:
+    if needs_tty:
+        return _simulate_tty(obj, commands=commands)
+    return run([str(LC3SIM)], cwd=LC3TOOLS_DIR, input_text=commands)
 
 
 def extract_global_value(output: str) -> int:
@@ -166,20 +259,44 @@ def ensure_output_contains(output: str, expected: str) -> None:
 
 def main() -> int:
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _progress(msg: str) -> None:
+        print(f"[test] {msg}", flush=True)
+
+    # ── 1. Golden comparison (always) ──
+    print("=== golden file comparison ===", flush=True)
+    golden_failures = run_golden_tests()
+    if golden_failures:
+        for f in golden_failures:
+            print(f"FAIL {f}")
+        print(f"\n{golden_failures.__len__()} GOLDEN MISMATCH(ES)")
+        return 1
+
+    if IS_CI:
+        print(f"\nCI mode: {len(CASES) + len(BEG_CASES)} golden files match. Done.")
+        return 0
+
+    # ── 2. Local-only: full simulation ──
+    print("\n=== local simulation ===", flush=True)
+
+    _progress("verify debug comments...")
     verify_debug_comments()
+    _progress("verify beginner style...")
     verify_beginner_style_success()
+    _progress("verify beginner stack case...")
     verify_beginner_style_stack_case_runs()
 
     failures: list[str] = []
     for case in CASES:
         try:
+            _progress(case.source)
             _, obj = compile_case(case)
             commands = f"file {obj}\ncontinue\n"
             if case.expected_global is not None:
                 commands += f"translate G_{case.expected_global[0]}\n"
             commands += case.program_input
             commands += "quit\n"
-            output = simulate(obj, commands=commands)
+            output = simulate(obj, commands=commands, needs_tty=bool(case.program_input))
 
             if case.expected_global is not None:
                 value = extract_global_value(output)
@@ -190,26 +307,23 @@ def main() -> int:
                     )
             if case.expected_output is not None:
                 ensure_output_contains(output, case.expected_output)
+        except subprocess.TimeoutExpired as exc:
+            failures.append(f"{case.source}: timeout after {exc.timeout}s\n{exc}")
         except Exception as exc:
             failures.append(str(exc))
 
     for case in BEG_CASES:
         try:
-            source = CASES_DIR / case.source
-            asm = BUILD_DIR / source.with_suffix(".asm").name
-            obj = BUILD_DIR / source.with_suffix(".obj").name
-            run(COMPILER_CMD + [str(source), "-o", str(asm), "--beginner-style"], cwd=ROOT)
-            run([str(LC3AS), str(asm.with_suffix(""))], cwd=LC3TOOLS_DIR)
-            generated_obj = asm.with_suffix(".obj")
-            generated_sym = asm.with_suffix(".sym")
-            shutil.move(generated_obj, obj)
-            shutil.move(generated_sym, BUILD_DIR / generated_sym.name)
+            _progress(f"[beginner] {case.source}")
+            _, obj = compile_case(case, extra_flags=["--beginner-style"])
             commands = f"file {obj}\ncontinue\n"
             commands += case.program_input
             commands += "quit\n"
-            output = simulate(obj, commands=commands)
+            output = simulate(obj, commands=commands, needs_tty=bool(case.program_input))
             if case.expected_output is not None:
                 ensure_output_contains(output, case.expected_output)
+        except subprocess.TimeoutExpired as exc:
+            failures.append(f"[beginner] {case.source}: timeout after {exc.timeout}s\n{exc}")
         except Exception as exc:
             failures.append(f"[beginner] {case.source}: {exc}")
 
@@ -217,12 +331,10 @@ def main() -> int:
         for failure in failures:
             print(failure)
             print("-" * 80)
+        print(f"\n{failures.__len__()} SIMULATION FAILURE(S)")
         return 1
 
-    for case in CASES:
-        print(f"PASS {case.source}")
-    for case in BEG_CASES:
-        print(f"PASS [beginner] {case.source}")
+    print(f"\nALL {len(CASES) + len(BEG_CASES)} TESTS PASSED (golden + simulation)")
     return 0
 
 

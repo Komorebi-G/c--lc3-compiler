@@ -452,7 +452,7 @@ main (int argc, char** argv)
 	lc3in = stdin;
 	gui_mode = 0;
 #if defined(USE_READLINE)
-	lc3readline = readline;
+	lc3readline = simple_readline;
 #endif
     }
 
@@ -1660,7 +1660,7 @@ flush_console_input ()
 
     /* Check option and script level.  Flushing would consume 
        remainder of a script. */
-    if (!flush_console || script_depth > 0)
+    if (!flush_console || script_depth > 0 || !isatty (fileno (lc3in)))
         return;
 
     /* Read a character at a time... */
