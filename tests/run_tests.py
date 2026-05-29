@@ -48,6 +48,14 @@ CASES = [
     Case("getchar_count_a.c", expected_output="3\n", program_input="abaca\n"),
 ]
 
+BEG_CASES = [
+    Case("beginner_loop_local.c", expected_output="3\n"),
+    Case("beginner_nested_call.c", expected_output="5\n"),
+    Case("beginner_global_local.c", expected_output="7\n"),
+    Case("beginner_input_loop.c", expected_output="4\n", program_input="test\n"),
+    Case("beginner_multi_func.c", expected_output="8\n"),
+]
+
 
 class TestFailure(RuntimeError):
     pass
@@ -93,11 +101,10 @@ def verify_debug_comments() -> None:
     run(COMPILER_CMD + [str(source), "-o", str(asm), "-d"], cwd=ROOT)
     text = asm.read_text(encoding="utf-8")
     required = [
-        "; 函数 sum_to(int n)",
-        "; 栈帧布局",
+        "; int sum_to(int n)",
+        "; stack frame layout",
         "; for (i = 0; i < n; i = i + 1)",
-        "; for 条件判断",
-        "; 调用 add(acc, i)",
+        "; add(acc, i)",
     ]
     for marker in required:
         if marker not in text:
@@ -128,8 +135,8 @@ def verify_beginner_style_stack_case_runs() -> None:
     text = asm.read_text(encoding="utf-8")
     if not text.startswith(".ORIG x3000\nmain\n"):
         raise TestFailure(f"beginner-style output should start directly at main:\n{text}")
-    if "LD R6, STACK_TOP" not in text:
-        raise TestFailure("beginner-style stack-dependent program should initialize stack inside main")
+    if "LD R6" in text or "LDR" in text or "STR R" in text:
+        raise TestFailure("beginner-style output should not use stack or LDR/STR:\n" + text)
 
     run([str(LC3AS), str(asm.with_suffix(""))], cwd=LC3TOOLS_DIR)
     generated_obj = asm.with_suffix(".obj")
@@ -186,6 +193,26 @@ def main() -> int:
         except Exception as exc:
             failures.append(str(exc))
 
+    for case in BEG_CASES:
+        try:
+            source = CASES_DIR / case.source
+            asm = BUILD_DIR / source.with_suffix(".asm").name
+            obj = BUILD_DIR / source.with_suffix(".obj").name
+            run(COMPILER_CMD + [str(source), "-o", str(asm), "--beginner-style"], cwd=ROOT)
+            run([str(LC3AS), str(asm.with_suffix(""))], cwd=LC3TOOLS_DIR)
+            generated_obj = asm.with_suffix(".obj")
+            generated_sym = asm.with_suffix(".sym")
+            shutil.move(generated_obj, obj)
+            shutil.move(generated_sym, BUILD_DIR / generated_sym.name)
+            commands = f"file {obj}\ncontinue\n"
+            commands += case.program_input
+            commands += "quit\n"
+            output = simulate(obj, commands=commands)
+            if case.expected_output is not None:
+                ensure_output_contains(output, case.expected_output)
+        except Exception as exc:
+            failures.append(f"[beginner] {case.source}: {exc}")
+
     if failures:
         for failure in failures:
             print(failure)
@@ -194,6 +221,8 @@ def main() -> int:
 
     for case in CASES:
         print(f"PASS {case.source}")
+    for case in BEG_CASES:
+        print(f"PASS [beginner] {case.source}")
     return 0
 
 

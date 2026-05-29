@@ -54,7 +54,7 @@ class Lexer:
             if ch == "/" and self._peek(1) == "*":
                 self._skip_block_comment()
                 continue
-            if ch.isalpha() or ch == "_":
+            if ch.isascii() and (ch.isalpha() or ch == "_"):
                 tokens.append(self._identifier())
                 continue
             if ch.isdigit():
@@ -83,7 +83,7 @@ class Lexer:
     def _identifier(self) -> Token:
         start = self.index
         line, col = self.line, self.column
-        while not self._eof() and (self._peek().isalnum() or self._peek() == "_"):
+        while not self._eof() and self._peek().isascii() and (self._peek().isalnum() or self._peek() == "_"):
             self._advance()
         text = self.source[start:self.index]
         kind = text if text in KEYWORDS else "IDENT"
@@ -127,6 +127,7 @@ class Lexer:
             self._advance()
 
     def _skip_block_comment(self) -> None:
+        line, col = self.line, self.column
         self._advance()
         self._advance()
         while not self._eof():
@@ -138,7 +139,7 @@ class Lexer:
                 self._advance_line()
             else:
                 self._advance()
-        raise LexerError("unterminated block comment")
+        raise LexerError(f"unterminated block comment at {line}:{col}")
 
     def _peek(self, offset: int = 0) -> str:
         idx = self.index + offset

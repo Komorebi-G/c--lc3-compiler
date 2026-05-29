@@ -14,6 +14,15 @@ BUILTINS = {"getchar", "putchar", "puts"}
 COMPARE_OPS = {"<", "<=", ">", ">=", "==", "!="}
 BARE_INSTRUCTIONS = {"RET", "GETC", "OUT", "PUTS", "HALT"}
 
+# LC-3 opcodes and assembler directives that would conflict with bare function labels
+LC3_RESERVED = {
+    "ADD", "AND", "NOT", "LD", "LDI", "LDR", "LEA",
+    "ST", "STI", "STR", "JMP", "JSR", "JSRR", "RET",
+    "RTI", "TRAP", "GETC", "OUT", "PUTS", "IN", "HALT",
+    "BR", "BRN", "BRZ", "BRP", "BRNZ", "BRNP", "BRZP", "BRNZP",
+    "ORIG", "END", "FILL", "BLKW", "STRINGZ",
+}
+
 
 @dataclass
 class LoopLabels:
@@ -31,7 +40,10 @@ class FunctionContext:
         self.local_names: List[str] = []
         self.local_count = 0
         self.loop_stack: List[LoopLabels] = []
-        self.end_label = self.generator.new_label(f"{func.name}_end")
+        if generator.beginner_style:
+            self.end_label = generator._beginner_label("END")
+        else:
+            self.end_label = generator.new_label(f"{func.name}_end")
         self.use_frame_pointer = True
         self.save_r7 = True
         self.saved_regs: List[str] = []
@@ -39,6 +51,7 @@ class FunctionContext:
         self.param_offset_base = 2
         self.direct_return_stmt_id: Optional[int] = None
         self.zero_init_locals: Set[str] = set()
+        self.beginner_var_labels: Dict[str, str] = {}
 
     def emit(self, line: str) -> None:
         self.lines.append(line)
@@ -54,9 +67,18 @@ class FunctionContext:
             raise CodegenError(f"duplicate local or parameter name: {name}")
         self.local_count += 1
         self.local_names.append(name)
+        if self.generator.beginner_style:
+            if self.func.name == "main":
+                label = name
+            else:
+                label = f"{self.func.name}_{name}"
+            self.beginner_var_labels[name] = label
+            self.generator.beginner_vars[(self.func.name, name)] = label
         return -self.local_count
 
-    def lookup(self, name: str) -> Optional[int]:
+    def lookup(self, name: str):
+        if self.generator.beginner_style:
+            return self.beginner_var_labels.get(name) or self.var_offsets.get(name)
         return self.var_offsets.get(name)
 
     def configure_frame(self, *, use_frame_pointer: bool, save_r7: bool, saved_regs: List[str]) -> None:
@@ -65,6 +87,15 @@ class FunctionContext:
         self.saved_regs = list(saved_regs)
         self.var_offsets = {}
         self.param_base_reg = "R5" if use_frame_pointer else "R6"
+        if self.generator.beginner_style:
+            for index, param in enumerate(self.param_names):
+                if self.func.name == "main":
+                    label = param
+                else:
+                    label = f"{self.func.name}_{param}"
+                self.beginner_var_labels[param] = label
+                self.generator.beginner_vars[(self.func.name, param)] = label
+            return
         if use_frame_pointer:
             self.param_offset_base = 2 if save_r7 else 1
         else:
@@ -90,16 +121,15 @@ class CodeGenerator:
         self.functions: Dict[str, ast.FunctionDef] = {}
         self.function_labels: Dict[str, str] = {}
         self.expr_registers = ["R0", "R1", "R2", "R3", "R4"]
-        self.beginner_program_uses_stack = False
+        self.beginner_label_counter = 0
+        self.beginner_vars: Dict[str, str] = {}  # (func_name, var_name) -> global label
+        self.beginner_ret_labels: List[str] = []
 
     def generate(self, program: ast.Program) -> str:
         self._collect_globals(program)
         self._collect_functions(program)
         if "main" not in self.functions:
             raise CodegenError("program must define int main()")
-        if self.beginner_style:
-            self.beginner_program_uses_stack = self._program_uses_stack_in_beginner_style(program)
-
         lines: List[str] = []
         lines.append(".ORIG x3000")
         if not self.beginner_style:
@@ -115,17 +145,42 @@ class CodeGenerator:
 
     def _emit_startup(self) -> List[str]:
         lines: List[str] = []
-        self._emit_comment(lines, "程序入口")
-        self._append_instruction(lines, "    LD R6, STACK_TOP", "初始化运行时栈指针")
-        self._append_instruction(lines, "    AND R5, R5, #0", "进入 main 前先清空帧指针")
-        self._append_instruction(lines, f"    JSR {self.function_labels['main']}", "调用 C 语言入口函数 main")
-        self._append_instruction(lines, "    HALT", "main 返回后停止机器")
+        self._emit_comment(lines, "entry")
+        self._append_instruction(lines, "    LD R6, STACK_TOP", "init SP")
+        self._append_instruction(lines, "    AND R5, R5, #0", "clear FP")
+        self._append_instruction(lines, f"    JSR {self.function_labels['main']}", "call main")
+        self._append_instruction(lines, "    HALT", "halt")
         return lines
 
     def new_label(self, prefix: str) -> str:
         label = f"{prefix}_{self.label_counter}"
         self.label_counter += 1
         return label
+
+    def _beginner_label(self, prefix: str) -> str:
+        label = f"{prefix}{self.beginner_label_counter}"
+        self.beginner_label_counter += 1
+        return label
+
+    _CTL_LABEL_MAP = {
+        "while_test": "LOOP",
+        "while_end": "DONE",
+        "for_test": "FORLP",
+        "for_step": "FORST",
+        "for_end": "FORDN",
+        "ifend": "ENDIF",
+        "else": "ELSE",
+        "not_true": "NOTT",
+        "not_end": "NOTE",
+        "cmp_true": "CMPT",
+        "cmp_end": "CMPE",
+    }
+
+    def _ctl_label(self, prefix: str) -> str:
+        if self.beginner_style:
+            mapped = self._CTL_LABEL_MAP.get(prefix, prefix)
+            return self._beginner_label(mapped)
+        return self.new_label(prefix)
 
     def _emit_comment(self, lines: List[str], text: str) -> None:
         if not self.debug_comments:
@@ -144,6 +199,7 @@ class CodeGenerator:
 
     def _optimize_assembly_lines(self, lines: List[str]) -> List[str]:
         lines = self._remove_unused_labels(lines)
+        lines = self._merge_duplicate_ands(lines)
         optimized: List[str] = []
         total = len(lines)
         for index, line in enumerate(lines):
@@ -159,6 +215,21 @@ class CodeGenerator:
                     continue
             optimized.append(line)
         return optimized
+
+    def _merge_duplicate_ands(self, lines: List[str]) -> List[str]:
+        result: List[str] = []
+        last_insn: Optional[str] = None
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith(";"):
+                result.append(line)
+                continue
+            insn = stripped.split(";", 1)[0].strip()
+            if insn == "AND R0, R0, #0" and last_insn == "AND R0, R0, #0":
+                continue
+            result.append(line)
+            last_insn = insn
+        return result
 
     def _remove_unused_labels(self, lines: List[str]) -> List[str]:
         referenced: set[str] = set()
@@ -242,15 +313,42 @@ class CodeGenerator:
             return f"[R5 + {offset}]"
         return f"[R5 - {-offset}]"
 
+    def _semantic_constant(self, value: int) -> str:
+        if 48 <= value <= 57:
+            return f"ASCII_{chr(value)}"
+        if 65 <= value <= 90:
+            return f"ASCII_{chr(value)}"
+        if 97 <= value <= 122:
+            return f"ASCII_{chr(value)}"
+        if value == 10:
+            return "NEWLINE"
+        if value == 32:
+            return "SPACE"
+        if value == 0:
+            return "ZERO"
+        return None
+
     def literal_label(self, value: int) -> str:
         if value not in self.literal_labels:
-            self.literal_labels[value] = f"LC_INT_{self.literal_counter}"
+            if self.beginner_style:
+                name = self._semantic_constant(value)
+                if name:
+                    self.literal_labels[value] = name
+                elif value >= 0:
+                    self.literal_labels[value] = f"N_{value}"
+                else:
+                    self.literal_labels[value] = f"N_NEG_{-value}"
+            else:
+                self.literal_labels[value] = f"LC_INT_{self.literal_counter}"
             self.literal_counter += 1
         return self.literal_labels[value]
 
     def string_label(self, value: str) -> str:
         if value not in self.string_labels:
-            self.string_labels[value] = f"LC_STR_{self.string_counter}"
+            if self.beginner_style:
+                self.string_labels[value] = f"STR{self.string_counter}"
+            else:
+                self.string_labels[value] = f"LC_STR_{self.string_counter}"
             self.string_counter += 1
         return self.string_labels[value]
 
@@ -270,13 +368,22 @@ class CodeGenerator:
             if func.name in self.functions:
                 raise CodegenError(f"duplicate function: {func.name}")
             self.functions[func.name] = func
-            self.function_labels[func.name] = "main" if func.name == "main" else f"FN_{func.name}"
+            if self.beginner_style:
+                if func.name.upper() in LC3_RESERVED:
+                    self.function_labels[func.name] = f"FN_{func.name}"
+                else:
+                    self.function_labels[func.name] = func.name
+            else:
+                self.function_labels[func.name] = "main" if func.name == "main" else f"FN_{func.name}"
 
     def _emit_function(self, func: ast.FunctionDef) -> List[str]:
         has_calls = self._block_has_calls(func.body)
         is_main = func.name == "main"
         last_stmt = self._last_executable_stmt(func.body)
         direct_return_stmt_id = id(last_stmt) if isinstance(last_stmt, ast.ReturnStmt) and self._count_returns_in_block(func.body) == 1 else None
+
+        if self.beginner_style:
+            return self._emit_function_beginner(func, has_calls, is_main, direct_return_stmt_id)
 
         preview_ctx = FunctionContext(self, func)
         self._collect_locals(preview_ctx, func.body)
@@ -295,10 +402,7 @@ class CodeGenerator:
         ctx.direct_return_stmt_id = direct_return_stmt_id
 
         lines: List[str] = [self.function_labels[func.name]]
-        self._emit_comment(lines, f"函数 {func.name}(" + ", ".join(f"int {param}" for param in func.params) + ")")
-        if self._main_is_program_entry(is_main) and self.beginner_program_uses_stack:
-            self._append_instruction(lines, "    LD R6, STACK_TOP", "初学者模式下仅在确实需要时初始化栈指针")
-            self._append_instruction(lines, "    AND R5, R5, #0", "初学者模式下仅在确实需要时清空帧指针")
+        self._emit_comment(lines, f"int {func.name}(" + ", ".join(f"int {param}" for param in func.params) + ")")
         if ctx.save_r7:
             lines.extend(
                 [
@@ -315,20 +419,20 @@ class CodeGenerator:
                 ]
             )
         for reg in ctx.saved_regs:
-            self._append_instruction(lines, "    ADD R6, R6, #-1", f"为保存寄存器 {reg} 预留栈槽")
-            self._append_instruction(lines, f"    STR {reg}, R6, #0", f"保存被调用者负责恢复的寄存器 {reg}")
+            self._append_instruction(lines, "    ADD R6, R6, #-1", f"save {reg}")
+            self._append_instruction(lines, f"    STR {reg}, R6, #0", "")
         if self.debug_comments:
             self._emit_function_layout(lines, ctx)
         if ctx.use_frame_pointer:
             for _ in range(ctx.local_count):
-                self._append_instruction(lines, "    ADD R6, R6, #-1", "为一个局部变量分配栈槽")
+                self._append_instruction(lines, "    ADD R6, R6, #-1", "alloc local")
             self._init_locals_zero(ctx)
         self._emit_block(ctx, func.body)
         lines.extend(ctx.lines)
         lines.append(f"{ctx.end_label}")
         if ctx.use_frame_pointer:
             for index, reg in enumerate(ctx.saved_regs, start=1):
-                self._append_instruction(lines, f"    LDR {reg}, R5, #-{index}", f"恢复被调用者保存的寄存器 {reg}")
+                self._append_instruction(lines, f"    LDR {reg}, R5, #-{index}", f"restore {reg}")
             lines.extend(
                 [
                     "    ADD R6, R5, #0",
@@ -346,62 +450,35 @@ class CodeGenerator:
         lines.append("    HALT" if self._main_is_program_entry(is_main) else "    RET")
         return lines
 
+    def _emit_function_beginner(self, func: ast.FunctionDef, has_calls: bool, is_main: bool, direct_return_stmt_id) -> List[str]:
+        ctx = FunctionContext(self, func)
+        self._collect_locals(ctx, func.body)
+        ctx.configure_frame(use_frame_pointer=False, save_r7=False, saved_regs=[])
+        ctx.direct_return_stmt_id = direct_return_stmt_id
+
+        lines: List[str] = [self.function_labels[func.name]]
+        self._emit_comment(lines, f"int {func.name}(" + ", ".join(f"int {param}" for param in func.params) + ")")
+        self._emit_block(ctx, func.body)
+        lines.extend(ctx.lines)
+        lines.append(f"{ctx.end_label}")
+        lines.append("    HALT" if is_main else "    RET")
+        return lines
+
     def _main_is_program_entry(self, is_main: bool) -> bool:
         return self.beginner_style and is_main
 
-    def _program_uses_stack_in_beginner_style(self, program: ast.Program) -> bool:
-        ordered_functions = [self.functions["main"]] + [func for func in program.functions if func.name != "main"]
-        for func in ordered_functions:
-            if self._function_needs_stack(func):
-                return True
-        return False
-
-    def _function_needs_stack(self, func: ast.FunctionDef) -> bool:
-        has_calls = self._block_has_calls(func.body)
-        is_entry_main = self.beginner_style and func.name == "main"
-        preview_ctx = FunctionContext(self, func)
-        self._collect_locals(preview_ctx, func.body)
-        preview_ctx.configure_frame(
-            use_frame_pointer=True,
-            save_r7=(has_calls and not is_entry_main),
-            saved_regs=[],
-        )
-        last_stmt = self._last_executable_stmt(func.body)
-        if isinstance(last_stmt, ast.ReturnStmt) and self._count_returns_in_block(func.body) == 1:
-            preview_ctx.direct_return_stmt_id = id(last_stmt)
-        self._emit_block(preview_ctx, func.body)
-        saved_regs = self._collect_modified_callee_regs(preview_ctx.lines)
-        if self._main_is_program_entry(func.name == "main"):
-            saved_regs = []
-        if preview_ctx.local_count > 0:
-            return True
-        if saved_regs:
-            return True
-        if has_calls and not is_entry_main:
-            return True
-        return self._lines_use_stack(preview_ctx.lines)
-
-    def _lines_use_stack(self, lines: List[str]) -> bool:
-        for line in lines:
-            stripped = line.split(";", 1)[0].strip()
-            if not stripped:
-                continue
-            if "R6" in stripped:
-                return True
-        return False
-
     def _emit_function_layout(self, lines: List[str], ctx: FunctionContext) -> None:
-        self._emit_comment(lines, "栈帧布局")
+        self._emit_comment(lines, "stack frame layout")
         if ctx.use_frame_pointer:
-            self._emit_comment(lines, "  [R5 + 0] 调用者保存的旧帧指针")
+            self._emit_comment(lines, "  [R5 + 0] saved FP")
             if ctx.save_r7:
-                self._emit_comment(lines, "  [R5 + 1] 保存的返回地址")
+                self._emit_comment(lines, "  [R5 + 1] saved R7")
             for index, reg in enumerate(ctx.saved_regs, start=1):
-                self._emit_comment(lines, f"  [R5 - {index}] 保存的寄存器 {reg}")
+                self._emit_comment(lines, f"  [R5 - {index}] saved {reg}")
         elif ctx.save_r7:
-            self._emit_comment(lines, "  [R6 + 0] 保存的返回地址")
+            self._emit_comment(lines, "  [R6 + 0] saved R7")
         else:
-            self._emit_comment(lines, "  本函数是叶子函数，不建立栈帧")
+            self._emit_comment(lines, "  leaf function, no frame")
         for name in ctx.param_names:
             offset = ctx.var_offsets[name]
             self._emit_comment(lines, f"  {self._format_named_location(ctx, offset)} {name}")
@@ -534,7 +611,7 @@ class CodeGenerator:
 
     def _expr_has_calls(self, expr: ast.Expr) -> bool:
         if isinstance(expr, ast.Call):
-            return True
+            return expr.name not in BUILTINS
         if isinstance(expr, ast.Assign):
             return self._expr_has_calls(expr.value)
         if isinstance(expr, ast.UnaryOp):
@@ -544,110 +621,117 @@ class CodeGenerator:
         return False
 
     def _init_locals_zero(self, ctx: FunctionContext) -> None:
+        if not ctx.zero_init_locals:
+            return
+        self._append_instruction(ctx.lines, "    AND R0, R0, #0", "zero-init locals")
         for name in sorted(ctx.zero_init_locals, key=lambda local_name: ctx.var_offsets[local_name], reverse=True):
             offset = ctx.var_offsets[name]
-            self._append_instruction(ctx.lines, "    AND R0, R0, #0", "准备 0，用于初始化局部变量")
             self._append_instruction(
                 ctx.lines,
                 f"    STR R0, R5, #{offset}",
-                f"把变量 {name}（{self._format_var_location(offset)}）初始化为 0",
+                f"{name} = 0",
             )
 
     def _emit_store_init(self, ctx: FunctionContext, name: str, expr: ast.Expr) -> None:
         self._emit_expr(ctx, expr)
         self._emit_store_var(ctx, name, "R0")
 
+    def _emit_blank(self, ctx: FunctionContext) -> None:
+        if ctx.lines and ctx.lines[-1] != "":
+            ctx.lines.append("")
+
     def _emit_block(self, ctx: FunctionContext, block: ast.Block) -> None:
+        had_decls = False
         for item in block.items:
             if isinstance(item, ast.VarDecl):
                 if item.init is not None:
-                    if isinstance(item.init, ast.IntLiteral) and item.init.value == 0:
-                        ctx.emit_comment(f"变量定义：int {item.name} = 0;")
-                        ctx.emit_comment("这个变量已经在函数入口统一清零，这里不再重复生成赋值")
-                    else:
-                        ctx.emit_comment(f"变量定义：int {item.name} = {self._expr_to_text(item.init)};")
-                        self._emit_store_init(ctx, item.name, item.init)
+                    ctx.emit_comment(f"int {item.name} = {self._expr_to_text(item.init)};")
+                    self._emit_store_init(ctx, item.name, item.init)
+                else:
+                    ctx.emit_comment(f"int {item.name};")
+                    self._append_instruction(ctx.lines, "    AND R0, R0, #0", f"{item.name} = 0")
+                    self._emit_store_var(ctx, item.name, "R0")
+                had_decls = True
                 continue
+            if had_decls and self.beginner_style:
+                self._emit_blank(ctx)
+                had_decls = False
             self._emit_stmt(ctx, item)
 
     def _emit_stmt(self, ctx: FunctionContext, stmt: ast.Statement) -> None:
         if isinstance(stmt, ast.ExprStmt):
-            ctx.emit_comment(self._stmt_to_text(stmt))
+            if not isinstance(stmt.expr, ast.Call):
+                ctx.emit_comment(self._stmt_to_text(stmt))
             self._emit_expr(ctx, stmt.expr)
             return
         if isinstance(stmt, ast.BlockStmt):
-            ctx.emit_comment("进入代码块")
             self._emit_block(ctx, stmt.block)
-            ctx.emit_comment("离开代码块")
             return
         if isinstance(stmt, ast.IfStmt):
+            if self.beginner_style:
+                self._emit_blank(ctx)
             ctx.emit_comment(f"if ({self._expr_to_text(stmt.condition)})")
             if stmt.else_branch is None:
-                end_label = self.new_label("ifend")
+                end_label = self._ctl_label("ifend")
                 self._emit_branch_if_false(ctx, stmt.condition, end_label)
                 self._emit_stmt(ctx, stmt.then_branch)
                 ctx.emit_label(end_label)
-                ctx.emit_comment("if 结束")
                 return
 
-            else_label = self.new_label("else")
+            else_label = self._ctl_label("else")
             end_label = self.new_label("ifend")
             self._emit_branch_if_false(ctx, stmt.condition, else_label)
             self._emit_stmt(ctx, stmt.then_branch)
             if not self._stmt_always_transfers(stmt.then_branch):
-                self._append_instruction(ctx.lines, f"    BRnzp {end_label}", "then 分支结束后跳过 else 分支")
+                self._append_instruction(ctx.lines, f"    BRnzp {end_label}", "skip else")
             ctx.emit_label(else_label)
-            ctx.emit_comment("否则执行这里")
+            ctx.emit_comment("else")
             self._emit_stmt(ctx, stmt.else_branch)
-            ctx.emit_comment("if 结束")
             ctx.emit_label(end_label)
             return
         if isinstance(stmt, ast.WhileStmt):
-            test_label = self.new_label("while_test")
-            end_label = self.new_label("while_end")
+            if self.beginner_style:
+                self._emit_blank(ctx)
+            test_label = self._ctl_label("while_test")
+            end_label = self._ctl_label("while_end")
             ctx.loop_stack.append(LoopLabels(end_label, test_label))
             ctx.emit_comment(f"while ({self._expr_to_text(stmt.condition)})")
             ctx.emit_label(test_label)
             self._emit_branch_if_false(ctx, stmt.condition, end_label)
-            ctx.emit_comment("while 循环体")
             self._emit_stmt(ctx, stmt.body)
-            self._append_instruction(ctx.lines, f"    BRnzp {test_label}", "跳回 while 条件重新判断")
+            self._append_instruction(ctx.lines, f"    BRnzp {test_label}", "loop")
             ctx.emit_label(end_label)
-            ctx.emit_comment("while 结束")
             ctx.loop_stack.pop()
             return
         if isinstance(stmt, ast.ForStmt):
-            test_label = self.new_label("for_test")
-            step_label = self.new_label("for_step")
-            end_label = self.new_label("for_end")
+            if self.beginner_style:
+                self._emit_blank(ctx)
+            test_label = self._ctl_label("for_test")
+            step_label = self._ctl_label("for_step")
+            end_label = self._ctl_label("for_end")
             init_text = self._expr_to_text(stmt.init) if stmt.init is not None else ""
             cond_text = self._expr_to_text(stmt.condition) if stmt.condition is not None else ""
             step_text = self._expr_to_text(stmt.step) if stmt.step is not None else ""
             ctx.emit_comment(f"for ({init_text}; {cond_text}; {step_text})")
             if stmt.init is not None:
-                ctx.emit_comment("for 初始化部分")
                 self._emit_expr(ctx, stmt.init)
             ctx.loop_stack.append(LoopLabels(end_label, step_label))
             ctx.emit_label(test_label)
             if stmt.condition is not None:
-                ctx.emit_comment("for 条件判断")
                 self._emit_branch_if_false(ctx, stmt.condition, end_label)
-            ctx.emit_comment("for 循环体")
             self._emit_stmt(ctx, stmt.body)
             ctx.emit_label(step_label)
             if stmt.step is not None:
-                ctx.emit_comment("for 步进部分")
                 self._emit_expr(ctx, stmt.step)
-            self._append_instruction(ctx.lines, f"    BRnzp {test_label}", "跳回 for 条件重新判断")
+            self._append_instruction(ctx.lines, f"    BRnzp {test_label}", "loop")
             ctx.emit_label(end_label)
-            ctx.emit_comment("for 结束")
             ctx.loop_stack.pop()
             return
         if isinstance(stmt, ast.BreakStmt):
             if not ctx.loop_stack:
                 raise CodegenError("break used outside loop")
             ctx.emit_comment("break;")
-            self._append_instruction(ctx.lines, f"    BRnzp {ctx.loop_stack[-1].break_label}", "跳到当前循环的结束位置")
+            self._append_instruction(ctx.lines, f"    BRnzp {ctx.loop_stack[-1].break_label}", "break")
             return
         if isinstance(stmt, ast.ContinueStmt):
             if not ctx.loop_stack:
@@ -656,19 +740,17 @@ class CodeGenerator:
             self._append_instruction(
                 ctx.lines,
                 f"    BRnzp {ctx.loop_stack[-1].continue_label}",
-                "直接进入当前循环的下一次迭代",
+                "continue",
             )
             return
         if isinstance(stmt, ast.ReturnStmt):
             ctx.emit_comment(self._stmt_to_text(stmt))
             if stmt.expr is None:
-                self._append_instruction(ctx.lines, "    AND R0, R0, #0", "返回 0")
+                self._append_instruction(ctx.lines, "    AND R0, R0, #0", "return 0")
             else:
                 self._emit_expr(ctx, stmt.expr)
-            if ctx.direct_return_stmt_id == id(stmt):
-                ctx.emit_comment("这是函数末尾唯一的 return，直接落入函数收尾代码")
-            else:
-                self._append_instruction(ctx.lines, f"    BRnzp {ctx.end_label}", "跳到统一的函数收尾代码")
+            if ctx.direct_return_stmt_id != id(stmt):
+                self._append_instruction(ctx.lines, f"    BRnzp {ctx.end_label}", "return")
             return
         raise CodegenError(f"unsupported statement: {stmt}")
 
@@ -688,7 +770,7 @@ class CodeGenerator:
     def _emit_branch_if_false(self, ctx: FunctionContext, expr: ast.Expr, false_label: str) -> None:
         if isinstance(expr, ast.IntLiteral):
             if expr.value == 0:
-                self._append_instruction(ctx.lines, f"    BRnzp {false_label}", "常量条件恒为假，直接跳转")
+                self._append_instruction(ctx.lines, f"    BRnzp {false_label}", "always false")
             return
         if isinstance(expr, ast.UnaryOp) and expr.op == "!":
             self._emit_branch_if_true(ctx, expr.operand, false_label)
@@ -697,13 +779,13 @@ class CodeGenerator:
             self._emit_compare_branch(ctx, expr, false_label, branch_on_false=True)
             return
         self._emit_expr(ctx, expr)
-        self._append_instruction(ctx.lines, "    ADD R0, R0, #0", f"根据 {self._expr_to_text(expr)} 设置条件码")
-        self._append_instruction(ctx.lines, f"    BRz {false_label}", "当 C 条件为假（0）时跳转")
+        self._append_instruction(ctx.lines, "    ADD R0, R0, #0", f"test {self._expr_to_text(expr)}")
+        self._append_instruction(ctx.lines, f"    BRz {false_label}", "skip if false")
 
     def _emit_branch_if_true(self, ctx: FunctionContext, expr: ast.Expr, true_label: str) -> None:
         if isinstance(expr, ast.IntLiteral):
             if expr.value != 0:
-                self._append_instruction(ctx.lines, f"    BRnzp {true_label}", "常量条件恒为真，直接跳转")
+                self._append_instruction(ctx.lines, f"    BRnzp {true_label}", "always true")
             return
         if isinstance(expr, ast.UnaryOp) and expr.op == "!":
             self._emit_branch_if_false(ctx, expr.operand, true_label)
@@ -712,22 +794,21 @@ class CodeGenerator:
             self._emit_compare_branch(ctx, expr, true_label, branch_on_false=False)
             return
         self._emit_expr(ctx, expr)
-        self._append_instruction(ctx.lines, "    ADD R0, R0, #0", f"根据 {self._expr_to_text(expr)} 设置条件码")
-        self._append_instruction(ctx.lines, f"    BRnp {true_label}", "当 C 条件为真（非 0）时跳转")
+        self._append_instruction(ctx.lines, "    ADD R0, R0, #0", f"test {self._expr_to_text(expr)}")
+        self._append_instruction(ctx.lines, f"    BRnp {true_label}", "skip if true")
 
     def _emit_compare_branch(self, ctx: FunctionContext, expr: ast.BinaryOp, label: str, *, branch_on_false: bool) -> None:
         self._emit_expr_into(ctx, expr.left, "R0", ["R1", "R2", "R3", "R4"])
         self._emit_expr_into(ctx, expr.right, "R1", ["R2", "R3", "R4"])
-        self._append_instruction(ctx.lines, "    NOT R1, R1", "比较时先计算 左值 - 右值")
-        self._append_instruction(ctx.lines, "    ADD R1, R1, #1", "R1 = -右值")
+        self._append_instruction(ctx.lines, "    NOT R1, R1", f"R1 = -{self._expr_to_text(expr.right)}")
+        self._append_instruction(ctx.lines, "    ADD R1, R1, #1", "")
         self._append_instruction(
             ctx.lines,
             "    ADD R1, R0, R1",
-            f"R1 = {self._expr_to_text(expr.left)} - {self._expr_to_text(expr.right)}",
+            f"{self._expr_to_text(expr.left)} - {self._expr_to_text(expr.right)}",
         )
         branch = self._compare_branch_opcode(expr.op, branch_on_false=branch_on_false)
-        desc = "假" if branch_on_false else "真"
-        self._append_instruction(ctx.lines, f"    {branch} {label}", f"当 {self._expr_to_text(expr)} 为{desc}时跳转")
+        self._append_instruction(ctx.lines, f"    {branch} {label}", f"{self._expr_to_text(expr)}")
 
     def _compare_branch_opcode(self, op: str, *, branch_on_false: bool) -> str:
         true_map = {
@@ -760,7 +841,7 @@ class CodeGenerator:
             self._append_instruction(
                 ctx.lines,
                 f"    LEA {target}, {label}",
-                f"{target} = 字符串字面量 {self._expr_to_text(expr)} 的地址",
+                f"{target} = &{self._expr_to_text(expr)}",
             )
             return
         if isinstance(expr, ast.Variable):
@@ -778,7 +859,7 @@ class CodeGenerator:
         if isinstance(expr, ast.UnaryOp):
             self._emit_expr_into(ctx, expr.operand, target, scratch)
             if expr.op == "-":
-                self._append_instruction(ctx.lines, f"    NOT {target}, {target}", "开始做补码取负")
+                self._append_instruction(ctx.lines, f"    NOT {target}, {target}", f"negate {self._expr_to_text(expr.operand)}")
                 self._append_instruction(
                     ctx.lines,
                     f"    ADD {target}, {target}, #1",
@@ -786,19 +867,19 @@ class CodeGenerator:
                 )
                 return
             if expr.op == "!":
-                true_label = self.new_label("not_true")
-                end_label = self.new_label("not_end")
+                true_label = self._ctl_label("not_true")
+                end_label = self._ctl_label("not_end")
                 self._append_instruction(
                     ctx.lines,
                     f"    ADD {target}, {target}, #0",
-                    f"判断 {self._expr_to_text(expr.operand)} 是否为 0",
+                    f"test {self._expr_to_text(expr.operand)}",
                 )
-                self._append_instruction(ctx.lines, f"    BRz {true_label}", "如果是 0，则逻辑非结果应为 1")
-                self._append_instruction(ctx.lines, f"    AND {target}, {target}, #0", "非 0 的逻辑非结果为 0")
-                self._append_instruction(ctx.lines, f"    BRnzp {end_label}", "跳过逻辑非为真的分支")
+                self._append_instruction(ctx.lines, f"    BRz {true_label}", f"!{self._expr_to_text(expr.operand)}: true")
+                self._append_instruction(ctx.lines, f"    AND {target}, {target}, #0", f"{target} = 0 (false)")
+                self._append_instruction(ctx.lines, f"    BRnzp {end_label}", "")
                 ctx.emit_label(true_label)
-                self._append_instruction(ctx.lines, f"    AND {target}, {target}, #0", f"先清空 {target}，再生成逻辑真")
-                self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #1", "逻辑非结果为 1")
+                self._append_instruction(ctx.lines, f"    AND {target}, {target}, #0", f"{target} = 1 (true)")
+                self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #1", "")
                 ctx.emit_label(end_label)
                 return
             raise CodegenError(f"unsupported unary operator: {expr.op}")
@@ -808,7 +889,7 @@ class CodeGenerator:
         if isinstance(expr, ast.Call):
             self._emit_call(ctx, expr)
             if target != "R0":
-                self._append_instruction(ctx.lines, f"    ADD {target}, R0, #0", f"把返回值复制到 {target}")
+                self._append_instruction(ctx.lines, f"    ADD {target}, R0, #0", f"{target} = retval")
             return
         raise CodegenError(f"unsupported expression: {expr}")
 
@@ -848,11 +929,11 @@ class CodeGenerator:
         self._emit_load_var(ctx, expr.name, target)
         if expr.is_postfix:
             update_reg = "R1" if target != "R1" else "R2"
-            self._append_instruction(ctx.lines, f"    ADD {update_reg}, {target}, #0", f"{update_reg} = {expr.name} 的旧值")
+            self._append_instruction(ctx.lines, f"    ADD {update_reg}, {target}, #0", f"{update_reg} = old {expr.name}")
             self._append_instruction(
                 ctx.lines,
                 f"    ADD {update_reg}, {update_reg}, #{expr.delta}",
-                f"{update_reg} = {self._expr_to_text(expr)} 更新后的值",
+                f"{update_reg} = new {expr.name}",
             )
             self._emit_store_var(ctx, expr.name, update_reg)
             return
@@ -864,7 +945,6 @@ class CodeGenerator:
         self._emit_store_var(ctx, expr.name, target)
 
     def _emit_binary(self, ctx: FunctionContext, expr: ast.BinaryOp, target: str, scratch: List[str]) -> None:
-        ctx.emit_comment(f"计算 {self._expr_to_text(expr)}")
         if not scratch:
             self._emit_binary_with_stack_fallback(ctx, expr, target)
             return
@@ -878,20 +958,20 @@ class CodeGenerator:
             self._append_instruction(ctx.lines, f"    ADD {target}, {target}, {right_reg}", f"{target} = {self._expr_to_text(expr)}")
             return
         if expr.op == "-":
-            self._append_instruction(ctx.lines, f"    NOT {right_reg}, {right_reg}", "减法先把右操作数取补码相反数")
-            self._append_instruction(ctx.lines, f"    ADD {right_reg}, {right_reg}, #1", "完成补码取负")
+            self._append_instruction(ctx.lines, f"    NOT {right_reg}, {right_reg}", f"negate {self._expr_to_text(expr.right)}")
+            self._append_instruction(ctx.lines, f"    ADD {right_reg}, {right_reg}, #1", "")
             self._append_instruction(ctx.lines, f"    ADD {target}, {target}, {right_reg}", f"{target} = {self._expr_to_text(expr)}")
             return
 
-        self._append_instruction(ctx.lines, f"    NOT {right_reg}, {right_reg}", "比较时先计算 左值 - 右值")
-        self._append_instruction(ctx.lines, f"    ADD {right_reg}, {right_reg}, #1", f"{right_reg} = -右值")
+        self._append_instruction(ctx.lines, f"    NOT {right_reg}, {right_reg}", f"{self._expr_to_text(expr.left)} - {self._expr_to_text(expr.right)}")
+        self._append_instruction(ctx.lines, f"    ADD {right_reg}, {right_reg}, #1", "")
         self._append_instruction(
             ctx.lines,
             f"    ADD {right_reg}, {target}, {right_reg}",
-            f"{right_reg} = {self._expr_to_text(expr.left)} - {self._expr_to_text(expr.right)}",
+            "",
         )
-        true_label = self.new_label("cmp_true")
-        end_label = self.new_label("cmp_end")
+        true_label = self._ctl_label("cmp_true")
+        end_label = self._ctl_label("cmp_end")
         branch = {
             "<": "BRn",
             "<=": "BRnz",
@@ -902,43 +982,44 @@ class CodeGenerator:
         }.get(expr.op)
         if branch is None:
             raise CodegenError(f"unsupported binary operator: {expr.op}")
-        self._append_instruction(ctx.lines, f"    {branch} {true_label}", f"当 {self._expr_to_text(expr)} 为真时跳转")
-        self._append_instruction(ctx.lines, f"    AND {target}, {target}, #0", "比较结果为假，记作 0")
-        self._append_instruction(ctx.lines, f"    BRnzp {end_label}", "跳过比较为真的分支")
+        self._append_instruction(ctx.lines, f"    {branch} {true_label}", f"{self._expr_to_text(expr)}: true")
+        self._append_instruction(ctx.lines, f"    AND {target}, {target}, #0", f"{target} = 0 (false)")
+        self._append_instruction(ctx.lines, f"    BRnzp {end_label}", "")
         ctx.emit_label(true_label)
-        self._append_instruction(ctx.lines, f"    AND {target}, {target}, #0", f"先清空 {target}，再写入真值")
-        self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #1", "比较结果为真，记作 1")
+        self._append_instruction(ctx.lines, f"    AND {target}, {target}, #0", f"{target} = 1 (true)")
+        self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #1", "")
         ctx.emit_label(end_label)
 
     def _emit_binary_with_stack_fallback(self, ctx: FunctionContext, expr: ast.BinaryOp, target: str) -> None:
-        ctx.emit_comment("寄存器不足，回退到临时压栈求值")
+        ctx.emit_comment("(spill to stack)")
         self._emit_expr_into(ctx, expr.left, target, [])
         self._push_reg(ctx, target)
         self._emit_expr_into(ctx, expr.right, target, [])
-        self._append_instruction(ctx.lines, "    ADD R6, R6, #-1", "把右操作数暂存在栈上")
-        self._append_instruction(ctx.lines, f"    STR {target}, R6, #0", "压入右操作数")
-        self._append_instruction(ctx.lines, f"    LDR R1, R6, #1", f"R1 = 左操作数（{self._expr_to_text(expr.left)}）")
-        self._append_instruction(ctx.lines, f"    LDR {target}, R6, #0", f"{target} = 右操作数（{self._expr_to_text(expr.right)}）")
-        self._append_instruction(ctx.lines, "    ADD R6, R6, #2", "弹出两个临时操作数")
+        self._append_instruction(ctx.lines, "    ADD R6, R6, #-1", "")
+        self._append_instruction(ctx.lines, f"    STR {target}, R6, #0", "")
+        temp_reg = "R1" if target != "R1" else "R2"
+        self._append_instruction(ctx.lines, f"    LDR {temp_reg}, R6, #1", f"{temp_reg} = {self._expr_to_text(expr.left)}")
+        self._append_instruction(ctx.lines, f"    LDR {target}, R6, #0", f"{target} = {self._expr_to_text(expr.right)}")
+        self._append_instruction(ctx.lines, "    ADD R6, R6, #2", "")
 
         if expr.op == "+":
-            self._append_instruction(ctx.lines, f"    ADD {target}, R1, {target}", f"{target} = {self._expr_to_text(expr)}")
+            self._append_instruction(ctx.lines, f"    ADD {target}, {temp_reg}, {target}", f"{target} = {self._expr_to_text(expr)}")
             return
         if expr.op == "-":
-            self._append_instruction(ctx.lines, f"    NOT {target}, {target}", "减法先把右操作数取补码相反数")
-            self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #1", "完成补码取负")
-            self._append_instruction(ctx.lines, f"    ADD {target}, R1, {target}", f"{target} = {self._expr_to_text(expr)}")
+            self._append_instruction(ctx.lines, f"    NOT {target}, {target}", f"negate {self._expr_to_text(expr.right)}")
+            self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #1", "")
+            self._append_instruction(ctx.lines, f"    ADD {target}, {temp_reg}, {target}", f"{target} = {self._expr_to_text(expr)}")
             return
 
-        self._append_instruction(ctx.lines, f"    NOT {target}, {target}", "比较时先计算 左值 - 右值")
-        self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #1", f"{target} = -右值")
+        self._append_instruction(ctx.lines, f"    NOT {target}, {target}", f"{self._expr_to_text(expr.left)} - {self._expr_to_text(expr.right)}")
+        self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #1", "")
         self._append_instruction(
             ctx.lines,
-            f"    ADD {target}, R1, {target}",
-            f"{target} = {self._expr_to_text(expr.left)} - {self._expr_to_text(expr.right)}",
+            f"    ADD {target}, {temp_reg}, {target}",
+            "",
         )
-        true_label = self.new_label("cmp_true")
-        end_label = self.new_label("cmp_end")
+        true_label = self._ctl_label("cmp_true")
+        end_label = self._ctl_label("cmp_end")
         branch = {
             "<": "BRn",
             "<=": "BRnz",
@@ -949,46 +1030,65 @@ class CodeGenerator:
         }.get(expr.op)
         if branch is None:
             raise CodegenError(f"unsupported binary operator: {expr.op}")
-        self._append_instruction(ctx.lines, f"    {branch} {true_label}", f"当 {self._expr_to_text(expr)} 为真时跳转")
-        self._append_instruction(ctx.lines, f"    AND {target}, {target}, #0", "比较结果为假，记作 0")
-        self._append_instruction(ctx.lines, f"    BRnzp {end_label}", "跳过比较为真的分支")
+        self._append_instruction(ctx.lines, f"    {branch} {true_label}", f"{self._expr_to_text(expr)}: true")
+        self._append_instruction(ctx.lines, f"    AND {target}, {target}, #0", f"{target} = 0 (false)")
+        self._append_instruction(ctx.lines, f"    BRnzp {end_label}", "")
         ctx.emit_label(true_label)
-        self._append_instruction(ctx.lines, f"    AND {target}, {target}, #0", f"先清空 {target}，再写入真值")
-        self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #1", "比较结果为真，记作 1")
+        self._append_instruction(ctx.lines, f"    AND {target}, {target}, #0", f"{target} = 1 (true)")
+        self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #1", "")
         ctx.emit_label(end_label)
 
     def _emit_call(self, ctx: FunctionContext, call: ast.Call) -> None:
-        ctx.emit_comment(f"调用 {self._expr_to_text(call)}")
+        ctx.emit_comment(self._expr_to_text(call))
         if call.name in BUILTINS:
             if call.name == "getchar":
                 if call.args:
                     raise CodegenError("getchar takes no arguments")
-                self._append_instruction(ctx.lines, "    GETC", "直接调用 LC-3 的 GETC 读入一个字符")
+                self._append_instruction(ctx.lines, "    GETC", "read char")
             elif call.name in {"putchar", "puts"}:
                 if len(call.args) != 1:
                     raise CodegenError(f"{call.name} takes exactly one argument")
                 self._emit_expr(ctx, call.args[0])
                 if call.name == "putchar":
-                    self._append_instruction(ctx.lines, "    OUT", "直接调用 LC-3 的 OUT 输出 R0 中的字符")
+                    self._append_instruction(ctx.lines, "    OUT", "print char")
                 else:
-                    self._append_instruction(ctx.lines, "    PUTS", "直接调用 LC-3 的 PUTS 输出 R0 指向的字符串")
-                self._append_instruction(ctx.lines, "    AND R0, R0, #0", f"{call.name} 的返回值固定记作 0")
+                    self._append_instruction(ctx.lines, "    PUTS", "print string")
+                if not self.beginner_style:
+                    self._append_instruction(ctx.lines, "    AND R0, R0, #0", f"{call.name} ret = 0")
             else:
                 raise CodegenError(f"unsupported builtin: {call.name}")
             return
-        for arg in reversed(call.args):
-            self._emit_expr(ctx, arg)
-            self._push_reg(ctx, "R0")
-        if call.name not in self.functions:
-            raise CodegenError(f"undefined function: {call.name}")
-        target = self.function_labels[call.name]
-        self._append_instruction(ctx.lines, f"    JSR {target}", f"调用 {call.name}")
-        if call.args:
-            self._emit_add_imm(ctx, "R6", len(call.args))
+        if self.beginner_style:
+            callee_func = self.functions.get(call.name)
+            if callee_func is None:
+                raise CodegenError(f"undefined function: {call.name}")
+            for i, arg in enumerate(call.args):
+                self._emit_expr(ctx, arg)
+                param_name = callee_func.params[i]
+                if call.name == "main":
+                    param_label = param_name
+                else:
+                    param_label = f"{call.name}_{param_name}"
+                self._append_instruction(ctx.lines, f"    ST R0, {param_label}", f"arg: {param_name}")
+            ret_label = self._beginner_label("RET")
+            self.beginner_ret_labels.append(ret_label)
+            self._append_instruction(ctx.lines, f"    ST R7, {ret_label}", "save R7")
+            self._append_instruction(ctx.lines, f"    JSR {self.function_labels[call.name]}", call.name)
+            self._append_instruction(ctx.lines, f"    LD R7, {ret_label}", "restore R7")
+        else:
+            for arg in reversed(call.args):
+                self._emit_expr(ctx, arg)
+                self._push_reg(ctx, "R0")
+            if call.name not in self.functions:
+                raise CodegenError(f"undefined function: {call.name}")
+            target = self.function_labels[call.name]
+            self._append_instruction(ctx.lines, f"    JSR {target}", call.name)
+            if call.args:
+                self._emit_add_imm(ctx, "R6", len(call.args))
 
     def _push_reg(self, ctx: FunctionContext, reg: str) -> None:
-        self._append_instruction(ctx.lines, "    ADD R6, R6, #-1", "在栈上为一个临时值腾出空间")
-        self._append_instruction(ctx.lines, f"    STR {reg}, R6, #0", f"把 {reg} 压栈")
+        self._append_instruction(ctx.lines, "    ADD R6, R6, #-1", f"push {reg}")
+        self._append_instruction(ctx.lines, f"    STR {reg}, R6, #0", "")
 
     def _pick_address_reg(self, *reserved: str) -> str:
         for reg in ("R4", "R3", "R2", "R1", "R0"):
@@ -997,62 +1097,91 @@ class CodeGenerator:
         raise CodegenError("no register available for address calculation")
 
     def _emit_load_var(self, ctx: FunctionContext, name: str, target: str) -> None:
-        offset = ctx.lookup(name)
-        if offset is not None:
+        result = ctx.lookup(name)
+        if result is not None:
+            if isinstance(result, str):
+                self._append_instruction(
+                    ctx.lines,
+                    f"    LD {target}, {result}",
+                    f"{target} = {name}",
+                )
+                return
             base_reg = ctx.param_base_reg if name in ctx.param_names else "R5"
             self._append_instruction(
                 ctx.lines,
-                f"    LDR {target}, {base_reg}, #{offset}",
-                f"{target} = 变量 {name}，来自 {self._format_named_location(ctx, offset) if name in ctx.param_names else self._format_var_location(offset)}",
+                f"    LDR {target}, {base_reg}, #{result}",
+                f"{target} = {name}",
             )
             return
         if name in self.globals:
-            addr_reg = self._pick_address_reg(target)
-            self._append_instruction(ctx.lines, f"    LEA {addr_reg}, {self.globals[name]}", f"{addr_reg} = 全局变量 {name} 的地址")
-            self._append_instruction(ctx.lines, f"    LDR {target}, {addr_reg}, #0", f"{target} = 全局变量 {name}")
+            if self.beginner_style:
+                self._append_instruction(ctx.lines, f"    LD {target}, {self.globals[name]}", f"{target} = {name}")
+            else:
+                addr_reg = self._pick_address_reg(target)
+                self._append_instruction(ctx.lines, f"    LEA {addr_reg}, {self.globals[name]}", "")
+                self._append_instruction(ctx.lines, f"    LDR {target}, {addr_reg}, #0", f"{target} = {name} (global)")
             return
         raise CodegenError(f"undefined variable: {name}")
 
     def _emit_store_var(self, ctx: FunctionContext, name: str, source: str) -> None:
-        offset = ctx.lookup(name)
-        if offset is not None:
+        result = ctx.lookup(name)
+        if result is not None:
+            if isinstance(result, str):
+                self._append_instruction(
+                    ctx.lines,
+                    f"    ST {source}, {result}",
+                    f"{name} = {source}",
+                )
+                return
             base_reg = ctx.param_base_reg if name in ctx.param_names else "R5"
             self._append_instruction(
                 ctx.lines,
-                f"    STR {source}, {base_reg}, #{offset}",
-                f"把 {source} 存回变量 {name}，位置是 {self._format_named_location(ctx, offset) if name in ctx.param_names else self._format_var_location(offset)}",
+                f"    STR {source}, {base_reg}, #{result}",
+                f"{name} = {source}",
             )
             return
         if name in self.globals:
-            addr_reg = self._pick_address_reg(source)
-            self._append_instruction(ctx.lines, f"    LEA {addr_reg}, {self.globals[name]}", f"{addr_reg} = 全局变量 {name} 的地址")
-            self._append_instruction(ctx.lines, f"    STR {source}, {addr_reg}, #0", f"把 {source} 存回全局变量 {name}")
+            if self.beginner_style:
+                self._append_instruction(ctx.lines, f"    ST {source}, {self.globals[name]}", f"{name} = {source}")
+            else:
+                addr_reg = self._pick_address_reg(source)
+                self._append_instruction(ctx.lines, f"    LEA {addr_reg}, {self.globals[name]}", "")
+                self._append_instruction(ctx.lines, f"    STR {source}, {addr_reg}, #0", f"{name} = {source} (global)")
             return
         raise CodegenError(f"undefined variable: {name}")
 
     def _emit_load_constant(self, ctx: FunctionContext, reg: str, value: int) -> None:
         if -16 <= value <= 15:
-            self._append_instruction(ctx.lines, f"    AND {reg}, {reg}, #0", f"先清空 {reg}，再加载常量 {value}")
-            if value != 0:
+            if value == 0:
+                self._append_instruction(ctx.lines, f"    AND {reg}, {reg}, #0", f"{reg} = 0")
+            else:
+                self._append_instruction(ctx.lines, f"    AND {reg}, {reg}, #0", "")
                 self._append_instruction(ctx.lines, f"    ADD {reg}, {reg}, #{value}", f"{reg} = {value}")
             return
-        self._append_instruction(ctx.lines, f"    LD {reg}, {self.literal_label(value)}", f"{reg} = 常量 {value}")
+        self._append_instruction(ctx.lines, f"    LD {reg}, {self.literal_label(value)}", f"{reg} = {value}")
 
     def _emit_add_imm(self, ctx: FunctionContext, reg: str, value: int) -> None:
         while value > 15:
-            self._append_instruction(ctx.lines, f"    ADD {reg}, {reg}, #15", f"先把 {reg} 增加 15")
+            self._append_instruction(ctx.lines, f"    ADD {reg}, {reg}, #15", "")
             value -= 15
         while value < -16:
-            self._append_instruction(ctx.lines, f"    ADD {reg}, {reg}, #-16", f"先把 {reg} 减少 16")
+            self._append_instruction(ctx.lines, f"    ADD {reg}, {reg}, #-16", "")
             value += 16
         if value != 0:
-            self._append_instruction(ctx.lines, f"    ADD {reg}, {reg}, #{value}", f"最后把 {reg} 调整 {value}")
+            self._append_instruction(ctx.lines, f"    ADD {reg}, {reg}, #{value}", "")
 
     def _emit_global_data(self) -> List[str]:
-        lines = ["STACK_TOP .FILL xF000"]
+        lines: List[str] = []
+        if not self.beginner_style:
+            lines.append("STACK_TOP .FILL xF000")
         for name, label in self.globals.items():
             value = self.global_inits[name]
             lines.append(f"{label} .FILL #{value}")
+        if self.beginner_style:
+            for (func_name, var_name), label in sorted(self.beginner_vars.items()):
+                lines.append(f"{label} .FILL #0")
+            for label in self.beginner_ret_labels:
+                lines.append(f"{label} .FILL #0")
         for value, label in self.string_labels.items():
             chars = [ord(ch) for ch in value] + [0]
             lines.append(f"{label} .FILL #{chars[0]}")
