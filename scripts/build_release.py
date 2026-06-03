@@ -67,7 +67,7 @@ def assemble_release(exe_dir: Path) -> Path:
 
     shutil.copytree(exe_dir / "_internal", target / "bin" / "_internal")
     shutil.copy2(exe_dir / exe_name(), target / "bin" / exe_name())
-    shutil.copy2(ROOT / "lc3说明书.md", target / "docs" / "lc3说明书.md")
+    shutil.copy2(ROOT / "README.md", target / "docs" / "lc3说明书.md")
     if (ROOT / "examples").exists():
         for item in (ROOT / "examples").iterdir():
             if item.is_file():
@@ -99,12 +99,13 @@ def assemble_release(exe_dir: Path) -> Path:
                 "",
                 f"- `bin/{exe_name()}`：编译器可执行文件",
                 "- `examples/`：示例输入程序",
-                "- `docs/lc3说明书.md`：语言子集说明",
+                "- `docs/lc3说明书.md`：当前语言子集、输出模式、测试方式和不支持特性的说明",
                 "",
                 "## 说明",
                 "",
                 "- 该发行版已自带 Python 运行时，目标机无需额外安装 Python。",
-                "- 本发行版用于把 C 语言子集编译为 LC-3 汇编。",
+                "- 本发行版用于把项目支持的 C 语言子集编译为 LC-3 汇编。",
+                "- 当前支持 `int`、`char`、`bool`、基础指针、局部数组、短路逻辑、乘除模和常见控制流。",
                 "- `-d` 会生成带注释的汇编，`--beginner-style` 会生成更接近初学者手写风格的汇编。",
                 "",
                 "## 输入与输出",
@@ -112,7 +113,7 @@ def assemble_release(exe_dir: Path) -> Path:
                 "- 输入：C 子集源文件",
                 "- 输出：LC-3 汇编文件（`.asm`）",
                 "",
-                "如需查看源码仓库、测试或开发说明，请参考项目源码目录中的文档，而不是本发行版。",
+                "完整语言特性和限制见 `docs/lc3说明书.md`。",
             ]
         )
         + "\n",
