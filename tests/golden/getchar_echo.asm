@@ -5,6 +5,8 @@
     HALT
 main
     ADD R6, R6, #-1
+    STR R7, R6, #0
+    ADD R6, R6, #-1
     STR R5, R6, #0
     ADD R5, R6, #0
     ADD R6, R6, #-1
@@ -12,7 +14,7 @@ main
     ADD R6, R6, #-1
     AND R0, R0, #0
     STR R0, R5, #-2
-while_test_5
+while_test_3
     GETC
     STR R0, R5, #-2
     LDR R0, R5, #-2
@@ -21,14 +23,14 @@ while_test_5
     NOT R1, R1
     ADD R1, R1, #1
     ADD R1, R0, R1
-    BRnp ifend_7
-    BRnzp while_end_6
-ifend_7
+    BRnp ifend_5
+    BRnzp while_end_4
+ifend_5
     LDR R0, R5, #-2
     OUT
     AND R0, R0, #0
-    BRnzp while_test_5
-while_end_6
+    BRnzp while_test_3
+while_end_4
     AND R0, R0, #0
     ADD R0, R0, #10
     OUT
@@ -36,6 +38,8 @@ while_end_6
     LDR R1, R5, #-1
     ADD R6, R5, #0
     LDR R5, R6, #0
+    ADD R6, R6, #1
+    LDR R7, R6, #0
     ADD R6, R6, #1
     RET
 STACK_TOP .FILL xF000

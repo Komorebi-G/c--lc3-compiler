@@ -5,7 +5,7 @@ main
     AND R0, R0, #0
     ST R0, cnt
 
-LOOP1
+LOOP_1
     GETC
     ST R0, ch
 
@@ -15,14 +15,14 @@ LOOP1
     NOT R1, R1
     ADD R1, R1, #1
     ADD R1, R0, R1
-    BRnp ENDIF3
-    BRnzp DONE2
-ENDIF3
+    BRnp ENDIF_3
+    BRnzp DONE_2
+ENDIF_3
     LD R0, cnt
     ADD R0, R0, #1
     ST R0, cnt
-    BRnzp LOOP1
-DONE2
+    BRnzp LOOP_1
+DONE_2
     LD R0, cnt
     LD R1, ASCII_0
     ADD R0, R0, R1
@@ -32,6 +32,7 @@ DONE2
     OUT
     AND R0, R0, #0
     HALT
+
 ch .FILL #0
 cnt .FILL #0
 ASCII_0 .FILL #48

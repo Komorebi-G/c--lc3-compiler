@@ -22,7 +22,10 @@ def optimize_block(block: ast.Block) -> ast.Block:
     for item in block.items:
         if isinstance(item, ast.VarDecl):
             init = optimize_expr(item.init) if item.init is not None else None
-            items.append(ast.VarDecl(item.name, init))
+            items.append(ast.VarDecl(item.name, init, item.var_type))
+        elif isinstance(item, ast.ArrayDecl):
+            init_list = [optimize_expr(e) for e in item.init_list] if item.init_list else None
+            items.append(ast.ArrayDecl(item.name, item.size, init_list))
         else:
             stmt = optimize_stmt(item)
             if stmt is not None:
@@ -91,6 +94,19 @@ def optimize_expr(expr: ast.Expr | None) -> ast.Expr | None:
     if isinstance(expr, ast.BinaryOp):
         left = optimize_expr(expr.left)
         right = optimize_expr(expr.right)
+        if expr.op == "&&":
+            # Short-circuit simplifications
+            if is_const_int(left):
+                if const_value(left) == 0:
+                    return ast.IntLiteral(0)  # 0 && x -> 0
+                # left is non-zero true: a && b -> b != 0 (simplify to b)
+                return optimize_expr(ast.UnaryOp("!", ast.UnaryOp("!", right)))
+        if expr.op == "||":
+            if is_const_int(left):
+                if const_value(left) != 0:
+                    return ast.IntLiteral(1)  # 1 || x -> 1
+                # left is 0: 0 || b -> b != 0 (simplify to b)
+                return optimize_expr(ast.UnaryOp("!", ast.UnaryOp("!", right)))
         if is_const_int(left) and is_const_int(right):
             lval = const_value(left)
             rval = const_value(right)
@@ -98,11 +114,43 @@ def optimize_expr(expr: ast.Expr | None) -> ast.Expr | None:
                 return ast.IntLiteral(lval + rval)
             if expr.op == "-":
                 return ast.IntLiteral(lval - rval)
+            if expr.op == "*":
+                return ast.IntLiteral(lval * rval)
+            if expr.op == "/":
+                if rval == 0:
+                    return ast.IntLiteral(0)
+                return ast.IntLiteral(int(lval / rval))  # truncate toward zero (C semantics)
+            if expr.op == "%":
+                if rval == 0:
+                    return ast.IntLiteral(0)
+                return ast.IntLiteral(lval - (int(lval / rval) * rval))  # C semantics: (a/b)*b + a%b == a
             if expr.op in COMPARE_OPS:
                 return ast.IntLiteral(1 if eval_compare(expr.op, lval, rval) else 0)
+            if expr.op == "&&":
+                return ast.IntLiteral(1 if (lval and rval) else 0)
+            if expr.op == "||":
+                return ast.IntLiteral(1 if (lval or rval) else 0)
         return ast.BinaryOp(expr.op, left, right)
     if isinstance(expr, ast.Call):
         return ast.Call(expr.name, [optimize_expr(arg) for arg in expr.args])
+    if isinstance(expr, ast.ArrayAccess):
+        return ast.ArrayAccess(optimize_expr(expr.array), optimize_expr(expr.index))
+    if isinstance(expr, ast.ArrayAssign):
+        return ast.ArrayAssign(expr.name, optimize_expr(expr.index), optimize_expr(expr.value))
+    if isinstance(expr, ast.Deref):
+        operand = optimize_expr(expr.operand)
+        # *&x -> x
+        if isinstance(operand, ast.AddrOf):
+            return operand.operand
+        return ast.Deref(operand)
+    if isinstance(expr, ast.AddrOf):
+        operand = optimize_expr(expr.operand)
+        # &*p -> p
+        if isinstance(operand, ast.Deref):
+            return operand.operand
+        return ast.AddrOf(operand)
+    if isinstance(expr, ast.DerefAssign):
+        return ast.DerefAssign(optimize_expr(expr.ptr), optimize_expr(expr.value))
     return expr
 
 

@@ -42,9 +42,17 @@ FN_add3
     ADD R6, R6, #-1
     STR R1, R6, #0
     LDR R0, R5, #1
+    ADD R6, R6, #-1
+    STR R0, R6, #0
     LDR R1, R5, #2
+    LDR R0, R6, #0
+    ADD R6, R6, #1
     ADD R0, R0, R1
+    ADD R6, R6, #-1
+    STR R0, R6, #0
     LDR R1, R5, #3
+    LDR R0, R6, #0
+    ADD R6, R6, #1
     ADD R0, R0, R1
     LDR R1, R5, #-1
     ADD R6, R5, #0
@@ -73,7 +81,11 @@ FN_mix
     ADD R6, R6, #3
     STR R0, R5, #-2
     LDR R0, R5, #-2
+    ADD R6, R6, #-1
+    STR R0, R6, #0
     LDR R1, R5, #3
+    LDR R0, R6, #0
+    ADD R6, R6, #1
     NOT R1, R1
     ADD R1, R1, #1
     ADD R0, R0, R1

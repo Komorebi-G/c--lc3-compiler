@@ -27,19 +27,19 @@ main
     NOT R1, R1
     ADD R1, R1, #1
     ADD R1, R0, R1
-    BRnp else_4
+    BRnp else_2
     LDR R0, R5, #-3
     ADD R6, R6, #-1
     STR R0, R6, #0
     JSR FN_inc
     ADD R6, R6, #1
     STR R0, R5, #-3
-    BRnzp ifend_5
-else_4
+    BRnzp ifend_3
+else_2
     AND R0, R0, #0
     ADD R0, R0, #9
     STR R0, R5, #-3
-ifend_5
+ifend_3
     LDR R0, R5, #-3
     LEA R4, G_result
     STR R0, R4, #0
@@ -59,8 +59,12 @@ FN_inc
     ADD R6, R6, #-1
     STR R1, R6, #0
     LDR R0, R5, #1
+    ADD R6, R6, #-1
+    STR R0, R6, #0
     AND R1, R1, #0
     ADD R1, R1, #1
+    LDR R0, R6, #0
+    ADD R6, R6, #1
     ADD R0, R0, R1
     LDR R1, R5, #-1
     ADD R6, R5, #0

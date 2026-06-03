@@ -40,10 +40,7 @@ class FunctionContext:
         self.local_names: List[str] = []
         self.local_count = 0
         self.loop_stack: List[LoopLabels] = []
-        if generator.beginner_style:
-            self.end_label = generator._beginner_label("END")
-        else:
-            self.end_label = generator.new_label(f"{func.name}_end")
+        self.end_label: Optional[str] = None
         self.use_frame_pointer = True
         self.save_r7 = True
         self.saved_regs: List[str] = []
@@ -61,6 +58,14 @@ class FunctionContext:
 
     def emit_comment(self, text: str) -> None:
         self.generator._emit_comment(self.lines, text)
+
+    def return_label(self) -> str:
+        if self.end_label is None:
+            if self.generator.beginner_style:
+                self.end_label = self.generator._beginner_label("RETURN")
+            else:
+                self.end_label = self.generator.new_label(f"{self.func.name}_end")
+        return self.end_label
 
     def alloc_local(self, name: str) -> int:
         if name in self.local_names or name in self.param_names:
@@ -121,9 +126,10 @@ class CodeGenerator:
         self.functions: Dict[str, ast.FunctionDef] = {}
         self.function_labels: Dict[str, str] = {}
         self.expr_registers = ["R0", "R1", "R2", "R3", "R4"]
-        self.beginner_label_counter = 0
+        self.beginner_label_counter = 1
         self.beginner_vars: Dict[str, str] = {}  # (func_name, var_name) -> global label
-        self.beginner_ret_labels: List[str] = []
+        self.beginner_storage_labels: List[str] = []
+        self._beginner_array_sizes: Dict[tuple, int] = {}  # (func_name, arr_name) -> size
 
     def generate(self, program: ast.Program) -> str:
         self._collect_globals(program)
@@ -158,22 +164,32 @@ class CodeGenerator:
         return label
 
     def _beginner_label(self, prefix: str) -> str:
-        label = f"{prefix}{self.beginner_label_counter}"
+        label = f"{prefix}_{self.beginner_label_counter}"
         self.beginner_label_counter += 1
+        return label
+
+    def _beginner_storage_label(self, prefix: str) -> str:
+        label = self._beginner_label(prefix)
+        self.beginner_storage_labels.append(label)
         return label
 
     _CTL_LABEL_MAP = {
         "while_test": "LOOP",
         "while_end": "DONE",
-        "for_test": "FORLP",
-        "for_step": "FORST",
-        "for_end": "FORDN",
+        "for_test": "LOOP",
+        "for_step": "NEXT",
+        "for_end": "DONE",
         "ifend": "ENDIF",
         "else": "ELSE",
-        "not_true": "NOTT",
-        "not_end": "NOTE",
-        "cmp_true": "CMPT",
-        "cmp_end": "CMPE",
+        "not_true": "NOT_TRUE",
+        "not_end": "NOT_DONE",
+        "cmp_true": "TRUE",
+        "cmp_end": "CMP_DONE",
+        "sc_false": "FALSE",
+        "sc_true": "TRUE",
+        "sc_end": "LOGIC_DONE",
+        "or_skip": "OR_DONE",
+        "and_skip": "AND_DONE",
     }
 
     def _ctl_label(self, prefix: str) -> str:
@@ -246,7 +262,7 @@ class CodeGenerator:
                 op = parts[0]
                 if op.startswith("BR") or op in {"JSR", "LD", "LEA"}:
                     target = parts[1].split(";", 1)[0].strip()
-                    if target and not target.startswith("#") and not target.startswith("R") and target != "STACK_TOP":
+                    if target and not target.startswith("#") and not self._is_register_name(target) and target != "STACK_TOP":
                         referenced.add(target)
 
         kept: List[str] = []
@@ -263,6 +279,9 @@ class CodeGenerator:
                 continue
             kept.append(line)
         return kept
+
+    def _is_register_name(self, text: str) -> bool:
+        return len(text) == 2 and text[0] == "R" and text[1] in "01234567"
 
     def _expr_to_text(self, expr: ast.Expr) -> str:
         if isinstance(expr, ast.IntLiteral):
@@ -282,6 +301,16 @@ class CodeGenerator:
             return f"{self._expr_to_text(expr.left)} {expr.op} {self._expr_to_text(expr.right)}"
         if isinstance(expr, ast.Call):
             return f"{expr.name}(" + ", ".join(self._expr_to_text(arg) for arg in expr.args) + ")"
+        if isinstance(expr, ast.ArrayAccess):
+            return f"{self._expr_to_text(expr.array)}[{self._expr_to_text(expr.index)}]"
+        if isinstance(expr, ast.ArrayAssign):
+            return f"{expr.name}[{self._expr_to_text(expr.index)}] = {self._expr_to_text(expr.value)}"
+        if isinstance(expr, ast.Deref):
+            return f"*({self._expr_to_text(expr.operand)})"
+        if isinstance(expr, ast.AddrOf):
+            return f"&{self._expr_to_text(expr.operand)}"
+        if isinstance(expr, ast.DerefAssign):
+            return f"*({self._expr_to_text(expr.ptr)}) = {self._expr_to_text(expr.value)}"
         return "<expr>"
 
     def _stmt_to_text(self, stmt: ast.Statement) -> str:
@@ -370,7 +399,7 @@ class CodeGenerator:
             self.functions[func.name] = func
             if self.beginner_style:
                 if func.name.upper() in LC3_RESERVED:
-                    self.function_labels[func.name] = f"FN_{func.name}"
+                    self.function_labels[func.name] = f"{func.name}_func"
                 else:
                     self.function_labels[func.name] = func.name
             else:
@@ -429,7 +458,8 @@ class CodeGenerator:
             self._init_locals_zero(ctx)
         self._emit_block(ctx, func.body)
         lines.extend(ctx.lines)
-        lines.append(f"{ctx.end_label}")
+        if ctx.end_label is not None:
+            lines.append(f"{ctx.end_label}")
         if ctx.use_frame_pointer:
             for index, reg in enumerate(ctx.saved_regs, start=1):
                 self._append_instruction(lines, f"    LDR {reg}, R5, #-{index}", f"restore {reg}")
@@ -456,11 +486,21 @@ class CodeGenerator:
         ctx.configure_frame(use_frame_pointer=False, save_r7=False, saved_regs=[])
         ctx.direct_return_stmt_id = direct_return_stmt_id
 
-        lines: List[str] = [self.function_labels[func.name]]
+        lines: List[str] = []
+        if not is_main:
+            lines.append("")
+        lines.append(self.function_labels[func.name])
         self._emit_comment(lines, f"int {func.name}(" + ", ".join(f"int {param}" for param in func.params) + ")")
+        save_r7_label = None
+        if has_calls and not is_main:
+            save_r7_label = self._beginner_storage_label("SAVE_R7")
+            self._append_instruction(lines, f"    ST R7, {save_r7_label}", "save R7")
         self._emit_block(ctx, func.body)
         lines.extend(ctx.lines)
-        lines.append(f"{ctx.end_label}")
+        if ctx.end_label is not None:
+            lines.append(f"{ctx.end_label}")
+        if save_r7_label is not None:
+            self._append_instruction(lines, f"    LD R7, {save_r7_label}", "restore R7")
         lines.append("    HALT" if is_main else "    RET")
         return lines
 
@@ -498,6 +538,14 @@ class CodeGenerator:
                 ctx.alloc_local(item.name)
                 if isinstance(item.init, ast.IntLiteral) and item.init.value == 0:
                     ctx.zero_init_locals.add(item.name)
+            elif isinstance(item, ast.ArrayDecl):
+                if self.beginner_style:
+                    base_label = self._beginner_array_label(item.name, 0, ctx.func.name)
+                    self._beginner_array_sizes[(ctx.func.name, item.name)] = item.size
+                    self.beginner_vars[(ctx.func.name, item.name)] = base_label
+                else:
+                    ctx.local_count += item.size
+                    ctx.local_names.append(item.name)
             elif isinstance(item, ast.BlockStmt):
                 self._collect_locals(ctx, item.block)
             elif isinstance(item, ast.IfStmt):
@@ -525,6 +573,9 @@ class CodeGenerator:
         for item in block.items:
             if isinstance(item, ast.VarDecl):
                 if item.init is not None and self._expr_has_calls(item.init):
+                    return True
+            elif isinstance(item, ast.ArrayDecl):
+                if item.init_list is not None and any(self._expr_has_calls(expr) for expr in item.init_list):
                     return True
             elif isinstance(item, ast.Statement) and self._stmt_has_calls(item):
                 return True
@@ -611,13 +662,23 @@ class CodeGenerator:
 
     def _expr_has_calls(self, expr: ast.Expr) -> bool:
         if isinstance(expr, ast.Call):
-            return expr.name not in BUILTINS
+            return True
         if isinstance(expr, ast.Assign):
             return self._expr_has_calls(expr.value)
         if isinstance(expr, ast.UnaryOp):
             return self._expr_has_calls(expr.operand)
         if isinstance(expr, ast.BinaryOp):
             return self._expr_has_calls(expr.left) or self._expr_has_calls(expr.right)
+        if isinstance(expr, ast.ArrayAccess):
+            return self._expr_has_calls(expr.array) or self._expr_has_calls(expr.index)
+        if isinstance(expr, ast.ArrayAssign):
+            return self._expr_has_calls(expr.index) or self._expr_has_calls(expr.value)
+        if isinstance(expr, ast.Deref):
+            return self._expr_has_calls(expr.operand)
+        if isinstance(expr, ast.AddrOf):
+            return self._expr_has_calls(expr.operand)
+        if isinstance(expr, ast.DerefAssign):
+            return self._expr_has_calls(expr.ptr) or self._expr_has_calls(expr.value)
         return False
 
     def _init_locals_zero(self, ctx: FunctionContext) -> None:
@@ -644,13 +705,36 @@ class CodeGenerator:
         had_decls = False
         for item in block.items:
             if isinstance(item, ast.VarDecl):
+                type_str = str(item.var_type)
                 if item.init is not None:
-                    ctx.emit_comment(f"int {item.name} = {self._expr_to_text(item.init)};")
+                    ctx.emit_comment(f"{type_str} {item.name} = {self._expr_to_text(item.init)};")
                     self._emit_store_init(ctx, item.name, item.init)
                 else:
-                    ctx.emit_comment(f"int {item.name};")
+                    ctx.emit_comment(f"{type_str} {item.name};")
                     self._append_instruction(ctx.lines, "    AND R0, R0, #0", f"{item.name} = 0")
                     self._emit_store_var(ctx, item.name, "R0")
+                had_decls = True
+                continue
+            if isinstance(item, ast.ArrayDecl):
+                coment = f"int {item.name}[{item.size}]"
+                if item.init_list:
+                    coment += " = {...}"
+                ctx.emit_comment(coment + ";")
+                if item.init_list:
+                    for i, init_expr in enumerate(item.init_list):
+                        if i >= item.size:
+                            break
+                        self._emit_expr(ctx, init_expr)
+                        if self.beginner_style:
+                            label = self._beginner_array_label(item.name, i, ctx.func.name)
+                            self._append_instruction(ctx.lines, f"    ST R0, {label}", f"{item.name}[{i}] = {self._expr_to_text(init_expr)}")
+                        else:
+                            # Store into stack frame: R5 + base_offset + i
+                            # Base offset is tracked in local_names, but we do individual stores
+                            offset = ctx.var_offsets.get(item.name)
+                            if offset is not None:
+                                store_offset = offset + i
+                                self._append_instruction(ctx.lines, f"    STR R0, R5, #{store_offset}", f"{item.name}[{i}] = {self._expr_to_text(init_expr)}")
                 had_decls = True
                 continue
             if had_decls and self.beginner_style:
@@ -679,7 +763,7 @@ class CodeGenerator:
                 return
 
             else_label = self._ctl_label("else")
-            end_label = self.new_label("ifend")
+            end_label = self._ctl_label("ifend")
             self._emit_branch_if_false(ctx, stmt.condition, else_label)
             self._emit_stmt(ctx, stmt.then_branch)
             if not self._stmt_always_transfers(stmt.then_branch):
@@ -707,7 +791,8 @@ class CodeGenerator:
             if self.beginner_style:
                 self._emit_blank(ctx)
             test_label = self._ctl_label("for_test")
-            step_label = self._ctl_label("for_step")
+            has_continue = self._stmt_has_current_loop_continue(stmt.body)
+            step_label = self._ctl_label("for_step") if has_continue else None
             end_label = self._ctl_label("for_end")
             init_text = self._expr_to_text(stmt.init) if stmt.init is not None else ""
             cond_text = self._expr_to_text(stmt.condition) if stmt.condition is not None else ""
@@ -715,12 +800,13 @@ class CodeGenerator:
             ctx.emit_comment(f"for ({init_text}; {cond_text}; {step_text})")
             if stmt.init is not None:
                 self._emit_expr(ctx, stmt.init)
-            ctx.loop_stack.append(LoopLabels(end_label, step_label))
+            ctx.loop_stack.append(LoopLabels(end_label, step_label or test_label))
             ctx.emit_label(test_label)
             if stmt.condition is not None:
                 self._emit_branch_if_false(ctx, stmt.condition, end_label)
             self._emit_stmt(ctx, stmt.body)
-            ctx.emit_label(step_label)
+            if step_label is not None:
+                ctx.emit_label(step_label)
             if stmt.step is not None:
                 self._emit_expr(ctx, stmt.step)
             self._append_instruction(ctx.lines, f"    BRnzp {test_label}", "loop")
@@ -750,7 +836,7 @@ class CodeGenerator:
             else:
                 self._emit_expr(ctx, stmt.expr)
             if ctx.direct_return_stmt_id != id(stmt):
-                self._append_instruction(ctx.lines, f"    BRnzp {ctx.end_label}", "return")
+                self._append_instruction(ctx.lines, f"    BRnzp {ctx.return_label()}", "return")
             return
         raise CodegenError(f"unsupported statement: {stmt}")
 
@@ -767,6 +853,23 @@ class CodeGenerator:
             return self._stmt_always_transfers(stmt.then_branch) and self._stmt_always_transfers(stmt.else_branch)
         return False
 
+    def _stmt_has_current_loop_continue(self, stmt: ast.Statement) -> bool:
+        if isinstance(stmt, ast.ContinueStmt):
+            return True
+        if isinstance(stmt, ast.BlockStmt):
+            return any(
+                isinstance(item, ast.Statement) and self._stmt_has_current_loop_continue(item)
+                for item in stmt.block.items
+            )
+        if isinstance(stmt, ast.IfStmt):
+            return (
+                self._stmt_has_current_loop_continue(stmt.then_branch)
+                or (stmt.else_branch is not None and self._stmt_has_current_loop_continue(stmt.else_branch))
+            )
+        if isinstance(stmt, (ast.WhileStmt, ast.ForStmt)):
+            return False
+        return False
+
     def _emit_branch_if_false(self, ctx: FunctionContext, expr: ast.Expr, false_label: str) -> None:
         if isinstance(expr, ast.IntLiteral):
             if expr.value == 0:
@@ -774,6 +877,18 @@ class CodeGenerator:
             return
         if isinstance(expr, ast.UnaryOp) and expr.op == "!":
             self._emit_branch_if_true(ctx, expr.operand, false_label)
+            return
+        # Short-circuit for &&: both must be true, so false if either is false
+        if isinstance(expr, ast.BinaryOp) and expr.op == "&&":
+            self._emit_branch_if_false(ctx, expr.left, false_label)
+            self._emit_branch_if_false(ctx, expr.right, false_label)
+            return
+        # Short-circuit for ||: false only if both are false
+        if isinstance(expr, ast.BinaryOp) and expr.op == "||":
+            skip_label = self._ctl_label("or_skip")
+            self._emit_branch_if_true(ctx, expr.left, skip_label)
+            self._emit_branch_if_false(ctx, expr.right, false_label)
+            ctx.emit_label(skip_label)
             return
         if isinstance(expr, ast.BinaryOp) and expr.op in COMPARE_OPS:
             self._emit_compare_branch(ctx, expr, false_label, branch_on_false=True)
@@ -789,6 +904,18 @@ class CodeGenerator:
             return
         if isinstance(expr, ast.UnaryOp) and expr.op == "!":
             self._emit_branch_if_false(ctx, expr.operand, true_label)
+            return
+        # Short-circuit for ||: true if either is true
+        if isinstance(expr, ast.BinaryOp) and expr.op == "||":
+            self._emit_branch_if_true(ctx, expr.left, true_label)
+            self._emit_branch_if_true(ctx, expr.right, true_label)
+            return
+        # Short-circuit for &&: true only if both are true
+        if isinstance(expr, ast.BinaryOp) and expr.op == "&&":
+            skip_label = self._ctl_label("and_skip")
+            self._emit_branch_if_false(ctx, expr.left, skip_label)
+            self._emit_branch_if_true(ctx, expr.right, true_label)
+            ctx.emit_label(skip_label)
             return
         if isinstance(expr, ast.BinaryOp) and expr.op in COMPARE_OPS:
             self._emit_compare_branch(ctx, expr, true_label, branch_on_false=False)
@@ -808,7 +935,13 @@ class CodeGenerator:
             f"{self._expr_to_text(expr.left)} - {self._expr_to_text(expr.right)}",
         )
         branch = self._compare_branch_opcode(expr.op, branch_on_false=branch_on_false)
-        self._append_instruction(ctx.lines, f"    {branch} {label}", f"{self._expr_to_text(expr)}")
+        self._append_instruction(ctx.lines, f"    {branch} {label}", self._compare_branch_comment(expr, branch_on_false))
+
+    def _compare_branch_comment(self, expr: ast.BinaryOp, branch_on_false: bool) -> str:
+        text = self._expr_to_text(expr)
+        if branch_on_false:
+            return f"if not ({text}), jump"
+        return f"if {text}, jump"
 
     def _compare_branch_opcode(self, op: str, *, branch_on_false: bool) -> str:
         true_map = {
@@ -830,7 +963,8 @@ class CodeGenerator:
         return (false_map if branch_on_false else true_map)[op]
 
     def _emit_expr(self, ctx: FunctionContext, expr: ast.Expr) -> None:
-        self._emit_expr_into(ctx, expr, "R0", ["R1", "R2", "R3", "R4"])
+        scratch = ["R1", "R2", "R3", "R4", "R5", "R6"] if self.beginner_style else ["R1", "R2", "R3", "R4"]
+        self._emit_expr_into(ctx, expr, "R0", scratch)
 
     def _emit_expr_into(self, ctx: FunctionContext, expr: ast.Expr, target: str, scratch: List[str]) -> None:
         if isinstance(expr, ast.IntLiteral):
@@ -884,12 +1018,30 @@ class CodeGenerator:
                 return
             raise CodegenError(f"unsupported unary operator: {expr.op}")
         if isinstance(expr, ast.BinaryOp):
-            self._emit_binary(ctx, expr, target, scratch)
+            if expr.op in ("&&", "||"):
+                self._emit_logical_binary(ctx, expr, target, scratch)
+            else:
+                self._emit_binary(ctx, expr, target, scratch)
             return
         if isinstance(expr, ast.Call):
             self._emit_call(ctx, expr)
             if target != "R0":
                 self._append_instruction(ctx.lines, f"    ADD {target}, R0, #0", f"{target} = retval")
+            return
+        if isinstance(expr, ast.ArrayAccess):
+            self._emit_array_access(ctx, expr, target, scratch)
+            return
+        if isinstance(expr, ast.ArrayAssign):
+            self._emit_array_assign(ctx, expr, target, scratch)
+            return
+        if isinstance(expr, ast.Deref):
+            self._emit_deref(ctx, expr, target, scratch)
+            return
+        if isinstance(expr, ast.AddrOf):
+            self._emit_addr_of(ctx, expr, target)
+            return
+        if isinstance(expr, ast.DerefAssign):
+            self._emit_deref_assign(ctx, expr, target, scratch)
             return
         raise CodegenError(f"unsupported expression: {expr}")
 
@@ -944,7 +1096,48 @@ class CodeGenerator:
         )
         self._emit_store_var(ctx, expr.name, target)
 
+    def _emit_logical_binary(self, ctx: FunctionContext, expr: ast.BinaryOp, target: str, scratch: List[str]) -> None:
+        """Emit short-circuit evaluation for && and ||. Produces 0 or 1 in target."""
+        if expr.op == "&&":
+            # a && b: if a is false, result=0; otherwise evaluate b as result
+            false_label = self._ctl_label("sc_false")
+            end_label = self._ctl_label("sc_end")
+            self._emit_branch_if_false(ctx, expr.left, false_label)
+            self._emit_expr_into(ctx, expr.right, target, scratch)
+            self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #0", f"test {self._expr_to_text(expr.right)}")
+            self._append_instruction(ctx.lines, f"    BRz {false_label}", "right is false")
+            # both true
+            self._append_instruction(ctx.lines, f"    AND {target}, {target}, #0", f"{target} = 1 (true)")
+            self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #1", "")
+            self._append_instruction(ctx.lines, f"    BRnzp {end_label}", "")
+            ctx.emit_label(false_label)
+            self._append_instruction(ctx.lines, f"    AND {target}, {target}, #0", f"{target} = 0 (false)")
+            ctx.emit_label(end_label)
+            return
+
+        if expr.op == "||":
+            # a || b: if a is true, result=1; otherwise evaluate b as result
+            true_label = self._ctl_label("sc_true")
+            end_label = self._ctl_label("sc_end")
+            self._emit_branch_if_true(ctx, expr.left, true_label)
+            self._emit_expr_into(ctx, expr.right, target, scratch)
+            self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #0", f"test {self._expr_to_text(expr.right)}")
+            self._append_instruction(ctx.lines, f"    BRnp {true_label}", "right is true")
+            # both false
+            self._append_instruction(ctx.lines, f"    AND {target}, {target}, #0", f"{target} = 0 (false)")
+            self._append_instruction(ctx.lines, f"    BRnzp {end_label}", "")
+            ctx.emit_label(true_label)
+            self._append_instruction(ctx.lines, f"    AND {target}, {target}, #0", f"{target} = 1 (true)")
+            self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #1", "")
+            ctx.emit_label(end_label)
+            return
+
+        raise CodegenError(f"unsupported logical operator: {expr.op}")
+
     def _emit_binary(self, ctx: FunctionContext, expr: ast.BinaryOp, target: str, scratch: List[str]) -> None:
+        if self.beginner_style and self._emit_beginner_binary_immediate(ctx, expr, target, scratch):
+            return
+
         if not scratch:
             self._emit_binary_with_stack_fallback(ctx, expr, target)
             return
@@ -952,7 +1145,21 @@ class CodeGenerator:
         right_reg = scratch[0]
         next_scratch = [reg for reg in scratch[1:] if reg != target]
         self._emit_expr_into(ctx, expr.left, target, scratch)
+        # Save left result before evaluating right (right may clobber target).
+        save_label = None
+        save_left = not (self.beginner_style and self._expr_preserves_other_registers(expr.right))
+        if self.beginner_style and save_left:
+            save_label = self._beginner_storage_label("LEFT_VALUE")
+            self._append_instruction(ctx.lines, f"    ST {target}, {save_label}", f"save {self._expr_to_text(expr.left)}")
+        elif not self.beginner_style:
+            self._push_reg(ctx, target)
         self._emit_expr_into(ctx, expr.right, right_reg, next_scratch)
+        # Restore left result into target
+        if self.beginner_style and save_label is not None:
+            self._append_instruction(ctx.lines, f"    LD {target}, {save_label}", f"restore {self._expr_to_text(expr.left)}")
+        elif not self.beginner_style:
+            self._append_instruction(ctx.lines, f"    LDR {target}, R6, #0", f"restore {self._expr_to_text(expr.left)}")
+            self._append_instruction(ctx.lines, f"    ADD R6, R6, #1", "")
 
         if expr.op == "+":
             self._append_instruction(ctx.lines, f"    ADD {target}, {target}, {right_reg}", f"{target} = {self._expr_to_text(expr)}")
@@ -961,6 +1168,12 @@ class CodeGenerator:
             self._append_instruction(ctx.lines, f"    NOT {right_reg}, {right_reg}", f"negate {self._expr_to_text(expr.right)}")
             self._append_instruction(ctx.lines, f"    ADD {right_reg}, {right_reg}, #1", "")
             self._append_instruction(ctx.lines, f"    ADD {target}, {target}, {right_reg}", f"{target} = {self._expr_to_text(expr)}")
+            return
+        if expr.op in ("*", "/", "%"):
+            if len(next_scratch) < 3:
+                self._emit_binary_with_stack_fallback(ctx, expr, target)
+                return
+            self._emit_mul_div_mod(ctx, expr, target, right_reg, next_scratch)
             return
 
         self._append_instruction(ctx.lines, f"    NOT {right_reg}, {right_reg}", f"{self._expr_to_text(expr.left)} - {self._expr_to_text(expr.right)}")
@@ -990,6 +1203,138 @@ class CodeGenerator:
         self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #1", "")
         ctx.emit_label(end_label)
 
+    def _emit_beginner_binary_immediate(self, ctx: FunctionContext, expr: ast.BinaryOp, target: str, scratch: List[str]) -> bool:
+        if not isinstance(expr.right, ast.IntLiteral):
+            return False
+        if expr.op == "+":
+            delta = expr.right.value
+        elif expr.op == "-":
+            delta = -expr.right.value
+        else:
+            return False
+        if delta < -16 or delta > 15:
+            return False
+
+        self._emit_expr_into(ctx, expr.left, target, scratch)
+        if delta != 0:
+            self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #{delta}", f"{target} = {self._expr_to_text(expr)}")
+        return True
+
+    def _expr_preserves_other_registers(self, expr: ast.Expr) -> bool:
+        if isinstance(expr, (ast.IntLiteral, ast.StringLiteral, ast.Variable)):
+            return True
+        if isinstance(expr, ast.AddrOf) and isinstance(expr.operand, ast.Variable):
+            return True
+        return False
+
+    def _emit_mul_div_mod(self, ctx: FunctionContext, expr: ast.BinaryOp, target: str,
+                          right_reg: str, scratch: List[str]) -> None:
+        """Emit software multiply, divide, or modulo. Uses 3 scratch regs beyond target+right_reg."""
+        acc = scratch[0]        # accumulator: product, quotient, or remainder
+        counter = scratch[1]    # counter (|left| for mul) or dividend (|left| for div/mod)
+        sign_reg = scratch[2]   # sign flag: 0=positive result, 1=negative result
+
+        # --- sign handling: make both operands positive, track sign ---
+        self._append_instruction(ctx.lines, f"    AND {sign_reg}, {sign_reg}, #0", "sign flag = 0")
+        self._append_instruction(ctx.lines, f"    ADD {counter}, {target}, #0", f"{counter} = |left| (copy)")
+
+        # make left positive
+        mul_left_ok = self.new_label("mul_left_ok")
+        self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #0")
+        self._append_instruction(ctx.lines, f"    BRzp {mul_left_ok}")
+        self._append_instruction(ctx.lines, f"    NOT {target}, {target}")
+        self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #1")
+        self._append_instruction(ctx.lines, f"    ADD {sign_reg}, {sign_reg}, #1", "toggle sign")
+        ctx.emit_label(mul_left_ok)
+
+        # make right positive
+        mul_right_ok = self.new_label("mul_right_ok")
+        self._append_instruction(ctx.lines, f"    ADD {right_reg}, {right_reg}, #0")
+        self._append_instruction(ctx.lines, f"    BRzp {mul_right_ok}")
+        self._append_instruction(ctx.lines, f"    NOT {right_reg}, {right_reg}")
+        self._append_instruction(ctx.lines, f"    ADD {right_reg}, {right_reg}, #1")
+        self._append_instruction(ctx.lines, f"    ADD {sign_reg}, {sign_reg}, #1", "toggle sign")
+        ctx.emit_label(mul_right_ok)
+
+        # --- dispatch on operator ---
+        if expr.op == "*":
+            self._emit_mul(ctx, target, right_reg, acc, counter, sign_reg)
+        else:
+            self._emit_div_mod(ctx, expr.op == "%", target, right_reg, acc, counter, sign_reg)
+
+    def _emit_mul(self, ctx: FunctionContext, left: str, right: str,
+                  acc: str, counter: str, sign_reg: str) -> None:
+        """|left| * |right| via repeated addition; |left| is in `counter` (copy of |left|)."""
+        self._append_instruction(ctx.lines, f"    AND {acc}, {acc}, #0", "acc = 0")
+        mul_loop = self.new_label("mul_loop")
+        mul_done = self.new_label("mul_done")
+        self._append_instruction(ctx.lines, f"    ADD {counter}, {left}, #0", "counter = |left|")
+        self._append_instruction(ctx.lines, f"    BRz {mul_done}")
+        ctx.emit_label(mul_loop)
+        self._append_instruction(ctx.lines, f"    ADD {acc}, {acc}, {right}", "acc += |right|")
+        self._append_instruction(ctx.lines, f"    ADD {counter}, {counter}, #-1")
+        self._append_instruction(ctx.lines, f"    BRp {mul_loop}")
+        ctx.emit_label(mul_done)
+        self._emit_apply_sign(ctx, acc, sign_reg, left)  # result back in left
+
+    def _emit_div_mod(self, ctx: FunctionContext, want_remainder: bool,
+                      left: str, right: str, acc: str, counter: str, sign_reg: str) -> None:
+        """|left| / |right| or |left| % |right| via repeated subtraction.
+
+        At entry: left=|left|, right=|right|, sign_reg=toggle-count,
+                  counter=stale copy (from before abs), acc=unused.
+
+        Strategy: save sign LSB into `left` (R0) because it's free during
+        the division loop.  First copy |left| to `counter` (dividend), then
+        overwrite `left` with sign flag.  After the loop, apply sign to
+        result and put it back in `left`."""
+        # 1. Copy |left| -> counter (dividend)
+        self._append_instruction(ctx.lines, f"    ADD {counter}, {left}, #0", "dividend = |left|")
+        # 2. Extract sign LSB and save in left (R0, now free)
+        self._append_instruction(ctx.lines, f"    AND {sign_reg}, {sign_reg}, #1", "sign = LSB")
+        self._append_instruction(ctx.lines, f"    ADD {left}, {sign_reg}, #0", "save sign in R0")
+        # Now: R0=sign(0|1), R1=divisor, R2=free, R3=dividend, R4=free(for temp)
+        # 3. Zero acc (quotient).  sign_reg is freed for loop temp.
+        self._append_instruction(ctx.lines, f"    AND {acc}, {acc}, #0", "quotient = 0")
+
+        # 4. Division by zero guard
+        div_loop = self.new_label("div_loop")
+        div_done = self.new_label("div_done")
+        self._append_instruction(ctx.lines, f"    ADD {right}, {right}, #0")
+        self._append_instruction(ctx.lines, f"    BRz {div_done}", "div by zero -> 0")
+
+        # 5. Repeated subtraction loop (sign_reg = R4 = temp)
+        ctx.emit_label(div_loop)
+        self._append_instruction(ctx.lines, f"    NOT {sign_reg}, {right}")
+        self._append_instruction(ctx.lines, f"    ADD {sign_reg}, {sign_reg}, #1")
+        self._append_instruction(ctx.lines, f"    ADD {sign_reg}, {counter}, {sign_reg}", "dividend - divisor")
+        self._append_instruction(ctx.lines, f"    BRn {div_done}")
+        self._append_instruction(ctx.lines, f"    ADD {counter}, {sign_reg}, #0", "dividend -= divisor")
+        self._append_instruction(ctx.lines, f"    ADD {acc}, {acc}, #1", "quotient++")
+        self._append_instruction(ctx.lines, f"    BRnzp {div_loop}")
+        ctx.emit_label(div_done)
+
+        # 6. Result: quotient in acc(R2), remainder in counter(R3), sign in left(R0)
+        result_reg = counter if want_remainder else acc
+        sign_ok = self.new_label("sign_ok")
+        self._append_instruction(ctx.lines, f"    ADD {left}, {left}, #0", "test sign")  # left still holds sign
+        self._append_instruction(ctx.lines, f"    BRz {sign_ok}")
+        self._append_instruction(ctx.lines, f"    NOT {result_reg}, {result_reg}")
+        self._append_instruction(ctx.lines, f"    ADD {result_reg}, {result_reg}, #1")
+        ctx.emit_label(sign_ok)
+        self._append_instruction(ctx.lines, f"    ADD {left}, {result_reg}, #0", "R0 = result")
+
+    def _emit_apply_sign(self, ctx: FunctionContext, acc: str, sign_reg: str, target: str) -> None:
+        """Apply sign to acc: if sign_reg LSB is 1, negate acc. Result in target."""
+        self._append_instruction(ctx.lines, f"    AND {sign_reg}, {sign_reg}, #1", "sign = LSB")
+        self._append_instruction(ctx.lines, f"    ADD {target}, {acc}, #0")
+        sign_end = self.new_label("sign_end")
+        self._append_instruction(ctx.lines, f"    ADD {sign_reg}, {sign_reg}, #0")
+        self._append_instruction(ctx.lines, f"    BRz {sign_end}")
+        self._append_instruction(ctx.lines, f"    NOT {target}, {target}")
+        self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #1")
+        ctx.emit_label(sign_end)
+
     def _emit_binary_with_stack_fallback(self, ctx: FunctionContext, expr: ast.BinaryOp, target: str) -> None:
         ctx.emit_comment("(spill to stack)")
         self._emit_expr_into(ctx, expr.left, target, [])
@@ -1009,6 +1354,21 @@ class CodeGenerator:
             self._append_instruction(ctx.lines, f"    NOT {target}, {target}", f"negate {self._expr_to_text(expr.right)}")
             self._append_instruction(ctx.lines, f"    ADD {target}, {target}, #1", "")
             self._append_instruction(ctx.lines, f"    ADD {target}, {temp_reg}, {target}", f"{target} = {self._expr_to_text(expr)}")
+            return
+
+        # mul/div/mod: rearrange operands for _emit_mul_div_mod.
+        # Currently temp_reg=left, target=right. Need: target=left, right_reg=right.
+        if expr.op in ("*", "/", "%"):
+            self._append_instruction(ctx.lines, "    ADD R6, R6, #-1", "")
+            self._append_instruction(ctx.lines, f"    STR {target}, R6, #0", "save right to stack")
+            self._append_instruction(ctx.lines, f"    ADD {target}, {temp_reg}, #0", "target = left")
+            right_reg = "R2" if temp_reg != "R2" else "R3"
+            self._append_instruction(ctx.lines, f"    LDR {right_reg}, R6, #0", "right_reg = right")
+            self._append_instruction(ctx.lines, "    ADD R6, R6, #1", "pop right")
+            # Build scratch from registers not used by target or right_reg.
+            all_regs = ["R0", "R1", "R2", "R3", "R4"]
+            scratch_regs = [r for r in all_regs if r != target and r != right_reg][:3]
+            self._emit_mul_div_mod(ctx, expr, target, right_reg, scratch_regs)
             return
 
         self._append_instruction(ctx.lines, f"    NOT {target}, {target}", f"{self._expr_to_text(expr.left)} - {self._expr_to_text(expr.right)}")
@@ -1070,11 +1430,7 @@ class CodeGenerator:
                 else:
                     param_label = f"{call.name}_{param_name}"
                 self._append_instruction(ctx.lines, f"    ST R0, {param_label}", f"arg: {param_name}")
-            ret_label = self._beginner_label("RET")
-            self.beginner_ret_labels.append(ret_label)
-            self._append_instruction(ctx.lines, f"    ST R7, {ret_label}", "save R7")
             self._append_instruction(ctx.lines, f"    JSR {self.function_labels[call.name]}", call.name)
-            self._append_instruction(ctx.lines, f"    LD R7, {ret_label}", "restore R7")
         else:
             for arg in reversed(call.args):
                 self._emit_expr(ctx, arg)
@@ -1085,6 +1441,134 @@ class CodeGenerator:
             self._append_instruction(ctx.lines, f"    JSR {target}", call.name)
             if call.args:
                 self._emit_add_imm(ctx, "R6", len(call.args))
+
+    # ── array / pointer codegen ──────────────────────────────────────────
+
+    def _emit_array_access(self, ctx: FunctionContext, expr: ast.ArrayAccess,
+                           target: str, scratch: List[str]) -> None:
+        """Load arr[index] into target via base+index, then LDR."""
+        if not isinstance(expr.array, ast.Variable):
+            raise CodegenError("array access requires a named array variable")
+        name = expr.array.name
+
+        addr_reg = scratch[0] if scratch and scratch[0] != target else (scratch[1] if len(scratch) > 1 else self._pick_address_reg(target))
+        self._emit_expr_into(ctx, expr.index, target, scratch)
+        self._emit_array_base_addr(ctx, name, addr_reg)
+        self._append_instruction(ctx.lines, f"    ADD {addr_reg}, {addr_reg}, {target}")
+        self._append_instruction(ctx.lines, f"    LDR {target}, {addr_reg}, #0", f"{target} = {name}[{self._expr_to_text(expr.index)}]")
+
+    def _emit_array_assign(self, ctx: FunctionContext, expr: ast.ArrayAssign,
+                           target: str, scratch: List[str]) -> None:
+        """Store value into arr[index] via base+index, then STR.
+
+        Index is computed first (with full scratch including target) so that
+        mul/div/mod inside the index expression doesn't clobber the value
+        register.  The index is saved across the value computation."""
+        # Pick an index register distinct from the eventual value target.
+        idx_reg = scratch[0] if scratch and scratch[0] != target else (scratch[1] if len(scratch) > 1 else self._pick_address_reg(target))
+        # Compute index first — full scratch pool (including target, which is
+        # free because we haven't computed the value yet).
+        all_regs = [r for r in ["R0", "R1", "R2", "R3", "R4", "R5", "R6"]
+                    if r != idx_reg]
+        self._emit_expr_into(ctx, expr.index, idx_reg, all_regs)
+        # Save index across value computation.
+        if self.beginner_style:
+            save_label = self._beginner_storage_label("ARRAY_INDEX")
+            self._append_instruction(ctx.lines, f"    ST {idx_reg}, {save_label}", f"save index ({self._expr_to_text(expr.index)})")
+        else:
+            self._push_reg(ctx, idx_reg)
+        # Compute value into target.
+        self._emit_expr_into(ctx, expr.value, target, scratch)
+        val_reg = target
+        # Restore index.
+        if self.beginner_style:
+            self._append_instruction(ctx.lines, f"    LD {idx_reg}, {save_label}", f"restore index")
+        else:
+            self._append_instruction(ctx.lines, f"    LDR {idx_reg}, R6, #0", "restore index")
+            self._append_instruction(ctx.lines, "    ADD R6, R6, #1", "")
+        addr_reg = scratch[0] if scratch and scratch[0] not in (val_reg, idx_reg) else (scratch[1] if len(scratch) > 1 and scratch[1] not in (val_reg, idx_reg) else self._pick_address_reg(val_reg, idx_reg))
+        self._emit_array_base_addr(ctx, expr.name, addr_reg)
+        self._append_instruction(ctx.lines, f"    ADD {addr_reg}, {addr_reg}, {idx_reg}")
+        self._append_instruction(ctx.lines, f"    STR {val_reg}, {addr_reg}, #0", f"{expr.name}[{self._expr_to_text(expr.index)}] = {self._expr_to_text(expr.value)}")
+
+    def _emit_array_base_addr(self, ctx: FunctionContext, name: str, addr_reg: str) -> None:
+        """Compute the base address of an array into addr_reg."""
+        # Check beginner mode first
+        if self.beginner_style:
+            beg_key = (ctx.func.name, name)
+            base_label = self.beginner_vars.get(beg_key)
+            if base_label is not None:
+                self._append_instruction(ctx.lines, f"    LEA {addr_reg}, {base_label}")
+                return
+            raise CodegenError(f"undefined beginner array: {name}")
+        result = ctx.lookup(name)
+        if result is not None:
+            # Default mode: R5 + offset
+            offset = result
+            if -16 <= offset <= 15:
+                self._append_instruction(ctx.lines, f"    ADD {addr_reg}, R5, #{offset}")
+            else:
+                self._emit_load_constant(ctx, addr_reg, offset)
+                self._append_instruction(ctx.lines, f"    ADD {addr_reg}, R5, {addr_reg}")
+            return
+        if name in self.globals:
+            self._append_instruction(ctx.lines, f"    LEA {addr_reg}, {self.globals[name]}")
+            return
+        raise CodegenError(f"undefined array: {name}")
+
+    def _beginner_array_label(self, name: str, index: int, func_name: str) -> str:
+        """Generate a global label for a beginner-mode array element."""
+        if func_name == "main":
+            return f"{name}_{index}"
+        return f"{func_name}_{name}_{index}"
+
+    def _emit_deref(self, ctx: FunctionContext, expr: ast.Deref,
+                    target: str, scratch: List[str]) -> None:
+        """Load *ptr: evaluate ptr, then LDR through it."""
+        self._emit_expr_into(ctx, expr.operand, target, scratch)
+        self._append_instruction(ctx.lines, f"    LDR {target}, {target}, #0", f"{target} = *ptr")
+
+    def _emit_addr_of(self, ctx: FunctionContext, expr: ast.AddrOf, target: str) -> None:
+        """Take address of &var or &arr[i]."""
+        inner = expr.operand
+        if isinstance(inner, ast.Variable):
+            result = ctx.lookup(inner.name)
+            if result is not None:
+                if isinstance(result, str):
+                    # Beginner mode: LEA to global label
+                    self._append_instruction(ctx.lines, f"    LEA {target}, {result}", f"{target} = &{inner.name}")
+                    return
+                # Default mode local: R5 + offset
+                offset = result
+                if -16 <= offset <= 15:
+                    self._append_instruction(ctx.lines, f"    ADD {target}, R5, #{offset}", f"{target} = &{inner.name}")
+                else:
+                    self._emit_load_constant(ctx, target, offset)
+                    self._append_instruction(ctx.lines, f"    ADD {target}, R5, {target}")
+                return
+            if inner.name in self.globals:
+                self._append_instruction(ctx.lines, f"    LEA {target}, {self.globals[inner.name]}", f"{target} = &{inner.name}")
+                return
+            raise CodegenError(f"undefined variable: {inner.name}")
+        if isinstance(inner, ast.ArrayAccess) and isinstance(inner.array, ast.Variable):
+            # &arr[i]: compute base + index
+            self._emit_array_base_addr(ctx, inner.array.name, target)
+            idx_reg = "R1"
+            self._emit_expr_into(ctx, inner.index, idx_reg, ["R2", "R3", "R4"])
+            self._append_instruction(ctx.lines, f"    ADD {target}, {target}, {idx_reg}")
+            return
+        raise CodegenError(f"cannot take address of this expression")
+
+    def _emit_deref_assign(self, ctx: FunctionContext, expr: ast.DerefAssign,
+                           target: str, scratch: List[str]) -> None:
+        """Store value through pointer: *ptr = value."""
+        self._emit_expr_into(ctx, expr.value, target, scratch)
+        ptr_reg = scratch[0] if scratch and scratch[0] != target else (
+            scratch[1] if len(scratch) > 1 else self._pick_address_reg(target))
+        self._emit_expr_into(ctx, expr.ptr, ptr_reg, [r for r in scratch if r != ptr_reg])
+        self._append_instruction(ctx.lines, f"    STR {target}, {ptr_reg}, #0", f"*ptr = {self._expr_to_text(expr.value)}")
+
+    # ── helpers ──────────────────────────────────────────────────────────
 
     def _push_reg(self, ctx: FunctionContext, reg: str) -> None:
         self._append_instruction(ctx.lines, "    ADD R6, R6, #-1", f"push {reg}")
@@ -1172,6 +1656,8 @@ class CodeGenerator:
 
     def _emit_global_data(self) -> List[str]:
         lines: List[str] = []
+        if self.beginner_style:
+            lines.append("")
         if not self.beginner_style:
             lines.append("STACK_TOP .FILL xF000")
         for name, label in self.globals.items():
@@ -1179,8 +1665,15 @@ class CodeGenerator:
             lines.append(f"{label} .FILL #{value}")
         if self.beginner_style:
             for (func_name, var_name), label in sorted(self.beginner_vars.items()):
-                lines.append(f"{label} .FILL #0")
-            for label in self.beginner_ret_labels:
+                arr_size = self._beginner_array_sizes.get((func_name, var_name))
+                if arr_size and arr_size > 1:
+                    # Array: emit consecutive labels arr_0, arr_1, ... arr_N-1
+                    for i in range(arr_size):
+                        elem_label = self._beginner_array_label(var_name, i, func_name)
+                        lines.append(f"{elem_label} .FILL #0")
+                else:
+                    lines.append(f"{label} .FILL #0")
+            for label in self.beginner_storage_labels:
                 lines.append(f"{label} .FILL #0")
         for value, label in self.string_labels.items():
             chars = [ord(ch) for ch in value] + [0]

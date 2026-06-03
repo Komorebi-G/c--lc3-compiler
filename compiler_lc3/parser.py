@@ -13,11 +13,30 @@ class Parser:
         self.tokens = tokens
         self.index = 0
 
+    def _parse_type_spec(self) -> ast.Type:
+        """Parse a type specifier: int, char, bool."""
+        if self._check("int") or self._check("char") or self._check("bool"):
+            base = self._advance().kind
+            return ast.Type(base, 0)
+        raise self._error(f"expected type, found {self._peek().kind}")
+
+    def _parse_declarator(self, base_type: ast.Type) -> tuple[str, ast.Type]:
+        """Parse a declarator: optional *s, then IDENT. Returns (name, full_type)."""
+        ptr_depth = 0
+        while self._match("*"):
+            ptr_depth += 1
+        name = self._expect("IDENT").value
+        return name, ast.Type(base_type.base, base_type.ptr_depth + ptr_depth)
+
     def parse_program(self) -> ast.Program:
         globals_: list[ast.GlobalDecl] = []
         functions: list[ast.FunctionDef] = []
         while not self._check("EOF"):
-            self._expect("int")
+            base = self._parse_type_spec()
+            # Pointer declarator for function return type? e.g. int* func() — skip *s
+            ptr_depth = 0
+            while self._match("*"):
+                ptr_depth += 1
             name = self._expect("IDENT").value
             if self._match("("):
                 params = self._parse_params()
@@ -36,7 +55,10 @@ class Parser:
         if self._match(")"):
             return params
         while True:
-            self._expect("int")
+            self._parse_type_spec()
+            # Skip pointer *s in param decl
+            while self._match("*"):
+                pass
             params.append(self._expect("IDENT").value)
             if self._match(")"):
                 return params
@@ -46,21 +68,37 @@ class Parser:
         self._expect("{")
         items: list[ast.BlockItem] = []
         while not self._check("}"):
-            if self._check("int"):
+            if self._check("int") or self._check("char") or self._check("bool"):
                 items.append(self._parse_decl())
             else:
                 items.append(self._parse_stmt())
         self._expect("}")
         return ast.Block(items)
 
-    def _parse_decl(self) -> ast.VarDecl:
-        self._expect("int")
-        name = self._expect("IDENT").value
+    def _parse_decl(self) -> ast.BlockItem:
+        base_type = self._parse_type_spec()
+        name, var_type = self._parse_declarator(base_type)
+        # Array declaration: int arr[size];
+        if self._match("["):
+            size = int(self._expect("NUMBER").value)
+            self._expect("]")
+            init_list = None
+            if self._match("="):
+                self._expect("{")
+                init_list = []
+                while not self._check("}"):
+                    init_list.append(self._parse_expr())
+                    if not self._match(","):
+                        break
+                self._expect("}")
+            self._expect(";")
+            return ast.ArrayDecl(name, size, init_list)
+        # Scalar declaration
         init = None
         if self._match("="):
             init = self._parse_expr()
         self._expect(";")
-        return ast.VarDecl(name, init)
+        return ast.VarDecl(name, init, var_type)
 
     def _parse_stmt(self) -> ast.Statement:
         if self._match("{"):
@@ -106,12 +144,73 @@ class Parser:
     def _parse_expr(self) -> ast.Expr:
         return self._parse_assignment()
 
+    # Compound assignment operators and their underlying binary ops.
+    _COMPOUND = {"+=": "+", "-=": "-", "*=": "*", "/=": "/", "%=": "%"}
+
     def _parse_assignment(self) -> ast.Expr:
+        expr = self._parse_logical_or()
+
+        # Detect = or compound assignment (+=, -=, *=, /=, %=)
+        op = None
+        if self._check("="):
+            op = "="
+        else:
+            for cop in self._COMPOUND:
+                if self._check(cop):
+                    op = cop
+                    break
+        if op is None:
+            return expr
+
+        self._advance()  # consume the assignment operator
+        rhs = self._parse_assignment()
+
+        # Simple assignment: x = rhs
+        if op == "=":
+            if isinstance(expr, ast.Variable):
+                return ast.Assign(expr.name, rhs)
+            if isinstance(expr, ast.ArrayAccess) and isinstance(expr.array, ast.Variable):
+                return ast.ArrayAssign(expr.array.name, expr.index, rhs)
+            if isinstance(expr, ast.Deref):
+                return ast.DerefAssign(expr.operand, rhs)
+            raise self._error("left side of assignment must be a variable, array element, or *ptr")
+
+        # Compound assignment: desugar lvalue op= rhs  →  lvalue = lvalue op rhs
+        binop = self._COMPOUND[op]
+
+        # Build a copy of the lvalue for use in the binary op.
+        if isinstance(expr, ast.Variable):
+            lhs_copy: ast.Expr = ast.Variable(expr.name)
+        elif isinstance(expr, ast.ArrayAccess) and isinstance(expr.array, ast.Variable):
+            lhs_copy = ast.ArrayAccess(ast.Variable(expr.array.name), expr.index)
+        elif isinstance(expr, ast.Deref):
+            lhs_copy = ast.Deref(expr.operand)
+        else:
+            raise self._error("left side of assignment must be a variable, array element, or *ptr")
+
+        combined = ast.BinaryOp(binop, lhs_copy, rhs)
+
+        if isinstance(expr, ast.Variable):
+            return ast.Assign(expr.name, combined)
+        if isinstance(expr, ast.ArrayAccess) and isinstance(expr.array, ast.Variable):
+            return ast.ArrayAssign(expr.array.name, expr.index, combined)
+        # ast.Deref
+        return ast.DerefAssign(expr.operand, combined)
+
+    def _parse_logical_or(self) -> ast.Expr:
+        expr = self._parse_logical_and()
+        while self._check("||"):
+            op = self._advance().kind
+            rhs = self._parse_logical_and()
+            expr = ast.BinaryOp(op, expr, rhs)
+        return expr
+
+    def _parse_logical_and(self) -> ast.Expr:
         expr = self._parse_equality()
-        if self._match("="):
-            if not isinstance(expr, ast.Variable):
-                raise self._error("left side of assignment must be a variable")
-            return ast.Assign(expr.name, self._parse_assignment())
+        while self._check("&&"):
+            op = self._advance().kind
+            rhs = self._parse_equality()
+            expr = ast.BinaryOp(op, expr, rhs)
         return expr
 
     def _parse_equality(self) -> ast.Expr:
@@ -130,11 +229,19 @@ class Parser:
             expr = ast.BinaryOp(op, expr, rhs)
         return expr
 
-    def _parse_additive(self) -> ast.Expr:
+    def _parse_multiplicative(self) -> ast.Expr:
         expr = self._parse_unary()
-        while self._check("+") or self._check("-"):
+        while self._check("*") or self._check("/") or self._check("%"):
             op = self._advance().kind
             rhs = self._parse_unary()
+            expr = ast.BinaryOp(op, expr, rhs)
+        return expr
+
+    def _parse_additive(self) -> ast.Expr:
+        expr = self._parse_multiplicative()
+        while self._check("+") or self._check("-"):
+            op = self._advance().kind
+            rhs = self._parse_multiplicative()
             expr = ast.BinaryOp(op, expr, rhs)
         return expr
 
@@ -153,6 +260,13 @@ class Parser:
             return ast.UnaryOp("-", self._parse_unary())
         if self._match("!"):
             return ast.UnaryOp("!", self._parse_unary())
+        if self._match("*"):
+            return ast.Deref(self._parse_unary())
+        if self._match("&"):
+            operand = self._parse_unary()
+            if not isinstance(operand, (ast.Variable, ast.ArrayAccess)):
+                raise self._error("operand of & must be a variable or array element")
+            return ast.AddrOf(operand)
         return self._parse_primary()
 
     def _parse_primary(self) -> ast.Expr:
@@ -174,6 +288,10 @@ class Parser:
                     self._expect(")")
                 return ast.Call(name, args)
             expr: ast.Expr = ast.Variable(name)
+            if self._match("["):
+                index = self._parse_expr()
+                self._expect("]")
+                expr = ast.ArrayAccess(expr, index)
             if self._match("++"):
                 return ast.IncDecOp(name, 1, True)
             if self._match("--"):

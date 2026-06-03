@@ -24,7 +24,11 @@ main
     ADD R6, R6, #1
     STR R0, R5, #-2
     LDR R0, R5, #-2
+    ADD R6, R6, #-1
+    STR R0, R6, #0
     LD R1, LC_INT_0
+    LDR R0, R6, #0
+    ADD R6, R6, #1
     ADD R0, R0, R1
     OUT
     AND R0, R0, #0
@@ -45,7 +49,11 @@ FN_add
     ADD R6, R6, #-1
     STR R1, R6, #0
     LDR R0, R5, #1
+    ADD R6, R6, #-1
+    STR R0, R6, #0
     LDR R1, R5, #2
+    LDR R0, R6, #0
+    ADD R6, R6, #1
     ADD R0, R0, R1
     LDR R1, R5, #-1
     ADD R6, R5, #0

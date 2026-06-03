@@ -29,66 +29,74 @@ main
     NOT R1, R1
     ADD R1, R1, #1
     ADD R1, R0, R1
-    BRzp ifend_8
+    BRzp ifend_6
     LDR R0, R5, #-5
     ADD R0, R0, #1
     STR R0, R5, #-5
-ifend_8
+ifend_6
     LDR R0, R5, #-3
     AND R1, R1, #0
     ADD R1, R1, #3
     NOT R1, R1
     ADD R1, R1, #1
     ADD R1, R0, R1
-    BRp ifend_9
+    BRp ifend_7
     LDR R0, R5, #-5
     ADD R0, R0, #2
     STR R0, R5, #-5
-ifend_9
+ifend_7
     LDR R0, R5, #-4
     LDR R1, R5, #-3
     NOT R1, R1
     ADD R1, R1, #1
     ADD R1, R0, R1
-    BRnz ifend_10
+    BRnz ifend_8
     LDR R0, R5, #-5
     ADD R0, R0, #4
     STR R0, R5, #-5
-ifend_10
+ifend_8
     LDR R0, R5, #-4
     AND R1, R1, #0
     ADD R1, R1, #5
     NOT R1, R1
     ADD R1, R1, #1
     ADD R1, R0, R1
-    BRn ifend_11
+    BRn ifend_9
     LDR R0, R5, #-5
     ADD R0, R0, #8
     STR R0, R5, #-5
-ifend_11
+ifend_9
     LDR R0, R5, #-3
     AND R1, R1, #0
     ADD R1, R1, #3
     NOT R1, R1
     ADD R1, R1, #1
     ADD R1, R0, R1
-    BRnp ifend_12
+    BRnp ifend_10
     LDR R0, R5, #-5
+    ADD R6, R6, #-1
+    STR R0, R6, #0
     LD R1, LC_INT_0
+    LDR R0, R6, #0
+    ADD R6, R6, #1
     ADD R0, R0, R1
     STR R0, R5, #-5
-ifend_12
+ifend_10
     LDR R0, R5, #-3
     LDR R1, R5, #-4
     NOT R1, R1
     ADD R1, R1, #1
     ADD R1, R0, R1
-    BRz ifend_13
+    BRz ifend_11
     LDR R0, R5, #-5
+    ADD R6, R6, #-1
+    STR R0, R6, #0
     LD R1, LC_INT_1
+    LDR R0, R6, #0
+    ADD R6, R6, #1
     ADD R0, R0, R1
     STR R0, R5, #-5
-ifend_13
+ifend_11
     LDR R0, R5, #-5
     LEA R4, G_result
     STR R0, R4, #0

@@ -21,14 +21,22 @@ main
     ADD R0, R0, #4
     STR R0, R5, #-4
     LDR R0, R5, #-3
+    ADD R6, R6, #-1
+    STR R0, R6, #0
     LDR R1, R5, #-4
+    LDR R0, R6, #0
+    ADD R6, R6, #1
     ADD R0, R0, R1
     STR R0, R5, #-3
     AND R0, R0, #0
     ADD R0, R0, #3
     STR R0, R5, #-5
     LDR R0, R5, #-3
+    ADD R6, R6, #-1
+    STR R0, R6, #0
     LDR R1, R5, #-5
+    LDR R0, R6, #0
+    ADD R6, R6, #1
     NOT R1, R1
     ADD R1, R1, #1
     ADD R0, R0, R1

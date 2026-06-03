@@ -4,6 +4,28 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Union
 
 
+@dataclass(frozen=True)
+class Type:
+    base: str          # "int", "char", "bool"
+    ptr_depth: int = 0  # 0=scalar, 1=*, 2=**...
+
+    def __str__(self) -> str:
+        return self.base + "*" * self.ptr_depth
+
+    @property
+    def is_ptr(self) -> bool:
+        return self.ptr_depth > 0
+
+    def pointee(self) -> "Type":
+        assert self.ptr_depth > 0
+        return Type(self.base, self.ptr_depth - 1)
+
+
+TYPE_INT = Type("int", 0)
+TYPE_CHAR = Type("char", 0)
+TYPE_BOOL = Type("bool", 0)
+
+
 @dataclass
 class Program:
     globals: List["GlobalDecl"]
@@ -28,13 +50,14 @@ class Block:
     items: List["BlockItem"] = field(default_factory=list)
 
 
-BlockItem = Union["VarDecl", "Statement"]
+BlockItem = Union["VarDecl", "ArrayDecl", "Statement"]
 
 
 @dataclass
 class VarDecl:
     name: str
     init: Optional["Expr"]
+    var_type: Type = field(default=TYPE_INT)
 
 
 class Statement:
@@ -136,3 +159,45 @@ class BinaryOp(Expr):
 class Call(Expr):
     name: str
     args: List[Expr]
+
+
+@dataclass
+class ArrayAccess(Expr):
+    """Array indexing: arr[index]"""
+    array: Expr
+    index: Expr
+
+
+@dataclass
+class ArrayDecl:
+    """Array declaration: int arr[10]; or int arr[10] = {1, 2};"""
+    name: str
+    size: int
+    init_list: Optional[List[Expr]] = None
+
+
+@dataclass
+class ArrayAssign(Expr):
+    """Assignment to array element: arr[index] = value"""
+    name: str
+    index: Expr
+    value: Expr
+
+
+@dataclass
+class Deref(Expr):
+    """Pointer dereference: *ptr"""
+    operand: Expr
+
+
+@dataclass
+class AddrOf(Expr):
+    """Address-of: &var"""
+    operand: Expr
+
+
+@dataclass
+class DerefAssign(Expr):
+    """Assignment through pointer: *ptr = value"""
+    ptr: Expr
+    value: Expr

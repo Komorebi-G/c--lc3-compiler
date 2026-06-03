@@ -24,34 +24,38 @@ main
     NOT R1, R1
     ADD R1, R1, #1
     ADD R1, R0, R1
-    BRnz else_6
+    BRnz else_4
     AND R0, R0, #0
     ADD R0, R0, #1
     LEA R4, G_result
     STR R0, R4, #0
-    BRnzp ifend_7
-else_6
+    BRnzp ifend_5
+else_4
     LDR R0, R5, #-3
+    ADD R6, R6, #-1
+    STR R0, R6, #0
     AND R1, R1, #0
     ADD R1, R1, #3
+    LDR R0, R6, #0
+    ADD R6, R6, #1
     ADD R0, R0, R1
     LDR R1, R5, #-4
     NOT R1, R1
     ADD R1, R1, #1
     ADD R1, R0, R1
-    BRnp else_8
+    BRnp else_6
     AND R0, R0, #0
     ADD R0, R0, #2
     LEA R4, G_result
     STR R0, R4, #0
-    BRnzp ifend_9
-else_8
+    BRnzp ifend_7
+else_6
     AND R0, R0, #0
     ADD R0, R0, #3
     LEA R4, G_result
     STR R0, R4, #0
-ifend_9
 ifend_7
+ifend_5
     AND R0, R0, #0
     LDR R1, R5, #-1
     LDR R4, R5, #-2

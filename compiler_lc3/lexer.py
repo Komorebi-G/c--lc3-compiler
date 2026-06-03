@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 KEYWORDS = {
     "int",
+    "char",
+    "bool",
     "if",
     "else",
     "while",
@@ -14,8 +16,9 @@ KEYWORDS = {
     "return",
 }
 
-TWO_CHAR = {"<=", ">=", "==", "!=", "&&", "||", "++", "--"}
-SINGLE_CHAR = set("(){};,=+-!<>")
+TWO_CHAR = {"<=", ">=", "==", "!=", "&&", "||", "++", "--",
+            "+=", "-=", "*=", "/=", "%="}
+SINGLE_CHAR = set("(){};,=+-!<>*/%[]&")
 
 
 @dataclass

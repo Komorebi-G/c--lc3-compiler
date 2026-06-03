@@ -5,14 +5,14 @@ main
     AND R0, R0, #0
     ST R0, acc
 
-LOOP1
+LOOP_1
     LD R0, i
     AND R1, R1, #0
     ADD R1, R1, #3
     NOT R1, R1
     ADD R1, R1, #1
     ADD R1, R0, R1
-    BRzp DONE2
+    BRzp DONE_2
     AND R0, R0, #0
     ST R0, tmp
 
@@ -27,8 +27,8 @@ LOOP1
     LD R0, i
     ADD R0, R0, #1
     ST R0, i
-    BRnzp LOOP1
-DONE2
+    BRnzp LOOP_1
+DONE_2
     LD R0, acc
     LD R1, ASCII_0
     ADD R0, R0, R1
@@ -38,6 +38,7 @@ DONE2
     OUT
     AND R0, R0, #0
     HALT
+
 acc .FILL #0
 i .FILL #0
 tmp .FILL #0

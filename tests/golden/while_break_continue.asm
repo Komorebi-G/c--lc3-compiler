@@ -20,14 +20,14 @@ main
     STR R0, R5, #-3
     AND R0, R0, #0
     STR R0, R5, #-4
-while_test_6
+while_test_4
     LDR R0, R5, #-3
     AND R1, R1, #0
     ADD R1, R1, #8
     NOT R1, R1
     ADD R1, R1, #1
     ADD R1, R0, R1
-    BRzp while_end_7
+    BRzp while_end_5
     LDR R0, R5, #-3
     ADD R0, R0, #1
     STR R0, R5, #-3
@@ -37,11 +37,15 @@ while_test_6
     NOT R1, R1
     ADD R1, R1, #1
     ADD R1, R0, R1
-    BRnp ifend_8
-    BRnzp while_test_6
-ifend_8
+    BRnp ifend_6
+    BRnzp while_test_4
+ifend_6
     LDR R0, R5, #-4
+    ADD R6, R6, #-1
+    STR R0, R6, #0
     LDR R1, R5, #-3
+    LDR R0, R6, #0
+    ADD R6, R6, #1
     ADD R0, R0, R1
     STR R0, R5, #-4
     LDR R0, R5, #-4
@@ -50,11 +54,11 @@ ifend_8
     NOT R1, R1
     ADD R1, R1, #1
     ADD R1, R0, R1
-    BRnz ifend_9
-    BRnzp while_end_7
-ifend_9
-    BRnzp while_test_6
-while_end_7
+    BRnz ifend_7
+    BRnzp while_end_5
+ifend_7
+    BRnzp while_test_4
+while_end_5
     LDR R0, R5, #-4
     LEA R4, G_result
     STR R0, R4, #0
