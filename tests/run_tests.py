@@ -109,6 +109,14 @@ CASES = [
     Case("string_escape_output.c", expected_output="A\nB\tC\n"),
     Case("nested_call_expression.c", expected_output="16\n"),
     Case("assignment_chain.c", expected_global=("result", 444)),
+    Case("for_continue_step.c", expected_output="4\n"),
+    Case("compare_negative_edges.c", expected_global=("result", 63)),
+    Case("double_pointer_read_write.c", expected_global=("result", 36)),
+    Case("address_simplify.c", expected_global=("result", 9)),
+    Case("logical_call_values.c", expected_global=("result", 7)),
+    Case("string_quote_backslash.c", expected_output="Q\"R\\S\n"),
+    Case("global_negative_word.c", expected_global=("result", -1)),
+    Case("for_step_call_continue.c", expected_output="4\n"),
 ]
 
 BEG_CASES = [
