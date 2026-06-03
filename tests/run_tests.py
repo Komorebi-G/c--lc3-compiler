@@ -41,6 +41,20 @@ class ObservedResult:
     global_value: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class Variant:
+    label: str
+    flags: tuple[str, ...] = ()
+
+
+SEMANTIC_VARIANTS = [
+    Variant("default"),
+    Variant("debug", ("-d",)),
+    Variant("beginner", ("--beginner-style",)),
+    Variant("debug+beginner", ("-d", "--beginner-style")),
+]
+
+
 CASES = [
     Case("if_else_chain.c", expected_global=("result", 2)),
     Case("while_break_continue.c", expected_global=("result", 13)),
@@ -85,6 +99,16 @@ CASES = [
     Case("array_call_index.c", expected_output="7\n"),
     Case("array_init_call.c", expected_output="5\n"),
     Case("pointer_call_value.c", expected_output="9\n"),
+    Case("for_empty_clauses.c", expected_output="18\n"),
+    Case("for_no_condition_break.c", expected_output="10\n"),
+    Case("early_return_nested.c", expected_global=("result", 15)),
+    Case("nested_loop_break_continue.c", expected_output="22\n"),
+    Case("pointer_array_address.c", expected_global=("out", 30)),
+    Case("deref_compound_assign.c", expected_global=("out", 4)),
+    Case("unary_logic_mix.c", expected_output="1111\n"),
+    Case("string_escape_output.c", expected_output="A\nB\tC\n"),
+    Case("nested_call_expression.c", expected_output="16\n"),
+    Case("assignment_chain.c", expected_global=("result", 444)),
 ]
 
 BEG_CASES = [
@@ -549,56 +573,16 @@ def main() -> int:
         print(f"\nCI mode: {len(CASES) + len(BEG_CASES)} golden files match. Done.")
         return 0
 
-    # ── 2. Local-only: full simulation ──
-    print("\n=== local simulation ===", flush=True)
+    all_cases = CASES + BEG_CASES
 
-    _progress("verify debug comments...")
-    verify_debug_comments()
-    _progress("verify beginner style...")
-    verify_beginner_style_success()
-    _progress("verify beginner stack case...")
-    verify_beginner_style_stack_case_runs()
-
-    failures: list[str] = []
-    lc3_results: dict[str, ObservedResult] = {}
-    for case in CASES:
-        try:
-            _progress(case.source)
-            lc3_results[case.source] = run_lc3_case(case)
-        except subprocess.TimeoutExpired as exc:
-            failures.append(f"{case.source}: timeout after {exc.timeout}s\n{exc}")
-        except Exception as exc:
-            failures.append(str(exc))
-
-    for case in BEG_CASES:
-        try:
-            _progress(f"[beginner] {case.source}")
-            lc3_results[case.source] = run_lc3_case(case, extra_flags=["--beginner-style"])
-        except subprocess.TimeoutExpired as exc:
-            failures.append(f"[beginner] {case.source}: timeout after {exc.timeout}s\n{exc}")
-        except Exception as exc:
-            failures.append(f"[beginner] {case.source}: {exc}")
-
-    if failures:
-        for failure in failures:
-            print(failure)
-            print("-" * 80)
-        print(f"\n{failures.__len__()} SIMULATION FAILURE(S)")
-        return 1
-
-    print("\n=== gcc oracle comparison ===", flush=True)
+    # ── 2. Local-only: GCC semantic oracle ──
+    print("\n=== gcc oracle ===", flush=True)
     gcc_failures: list[str] = []
-    for case in CASES + BEG_CASES:
+    gcc_results: dict[str, ObservedResult] = {}
+    for case in all_cases:
         try:
             _progress(f"[gcc] {case.source}")
-            gcc_result = run_gcc_case(case)
-            lc3_result = lc3_results[case.source]
-            if gcc_result != lc3_result:
-                raise TestFailure(
-                    f"{case.source}: LC-3 result differs from gcc oracle\n"
-                    f"  lc3: {lc3_result}\n"
-                    f"  gcc: {gcc_result}"
-                )
+            gcc_results[case.source] = run_gcc_case(case)
         except subprocess.TimeoutExpired as exc:
             gcc_failures.append(f"{case.source}: gcc timeout after {exc.timeout}s\n{exc}")
         except Exception as exc:
@@ -611,7 +595,48 @@ def main() -> int:
         print(f"\n{gcc_failures.__len__()} GCC ORACLE FAILURE(S)")
         return 1
 
-    print(f"\nALL {len(CASES) + len(BEG_CASES)} TESTS PASSED (golden + LC-3/GCC oracle comparison)")
+    # ── 3. Local-only: full LC-3 simulation for every semantic flag variant ──
+    print("\n=== local LC-3/GCC semantic variants ===", flush=True)
+
+    _progress("verify debug comments...")
+    verify_debug_comments()
+    _progress("verify beginner style...")
+    verify_beginner_style_success()
+    _progress("verify beginner stack case...")
+    verify_beginner_style_stack_case_runs()
+
+    failures: list[str] = []
+    checked_variants = 0
+    for variant in SEMANTIC_VARIANTS:
+        flags = list(variant.flags)
+        for case in all_cases:
+            try:
+                _progress(f"[{variant.label}] {case.source}")
+                lc3_result = run_lc3_case(case, extra_flags=flags)
+                gcc_result = gcc_results[case.source]
+                if lc3_result != gcc_result:
+                    raise TestFailure(
+                        f"{case.source} [{variant.label}]: LC-3 result differs from gcc oracle\n"
+                        f"  lc3: {lc3_result}\n"
+                        f"  gcc: {gcc_result}"
+                    )
+                checked_variants += 1
+            except subprocess.TimeoutExpired as exc:
+                failures.append(f"{case.source} [{variant.label}]: timeout after {exc.timeout}s\n{exc}")
+            except Exception as exc:
+                failures.append(f"{case.source} [{variant.label}]: {exc}")
+
+    if failures:
+        for failure in failures:
+            print(failure)
+            print("-" * 80)
+        print(f"\n{failures.__len__()} SIMULATION FAILURE(S)")
+        return 1
+
+    print(
+        f"\nALL {len(all_cases)} TESTS PASSED "
+        f"({checked_variants} LC-3 semantic variants + gcc oracle + golden)"
+    )
     return 0
 
 

@@ -142,8 +142,8 @@ BRzp DONE_3          ; if not (i < n), jump
 本地测试会做三类验证：
 
 1. 编译所有用例，并与 `tests/golden/` 中提交的汇编逐行对比。
-2. 调用 `lc3as` 汇编，并用 `lc3sim` 真实执行检查输出和全局变量。
-3. 用 `gcc` 编译同一份 C 用例生成本机 ELF，再把 GCC 的实际运行结果与 LC-3 仿真的实际运行结果直接对拍。
+2. 用 `gcc` 编译同一份 C 用例生成本机 ELF，记录 oracle 的实际输出或全局变量值。
+3. 对每个用例分别用默认、`-d`、`--beginner-style`、`-d --beginner-style` 生成 LC-3，调用 `lc3as` 汇编并用 `lc3sim` 真实执行，再把 LC-3 实际结果与 GCC 实际结果直接对拍。
 
 ```bash
 python3 tests/run_tests.py
@@ -177,10 +177,10 @@ python3 tests/oracle.py
 
 当前测试规模：
 
-- 49 个端到端 C 用例
+- 59 个端到端 C 用例
 - 覆盖默认模式、手写者风格、输入输出、数组、指针、复合赋值、乘除模、短路逻辑和调试注释
 - 本地用 GCC ELF 直接对拍全部注册用例的 LC-3 仿真实际结果
-- 本地额外验证 4 种参数组合：默认、`-d`、`--beginner-style`、`-d --beginner-style`
+- 本地对全部注册用例验证 4 种参数组合：默认、`-d`、`--beginner-style`、`-d --beginner-style`
 
 ### 更新 golden
 
