@@ -7,6 +7,7 @@ import select
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -380,6 +381,67 @@ def ensure_output_contains(output: str, expected: str) -> None:
         raise TestFailure(f"expected program output {expected!r} not found in simulator output:\n{output}")
 
 
+def _gcc_source(source: Path, case: Case) -> str:
+    text = source.read_text(encoding="utf-8")
+    prefix = (
+        "#include <stdbool.h>\n"
+        "#include <stdint.h>\n"
+        "#include <stdio.h>\n"
+        "static int lc3_getchar(void) { return fgetc(stdin); }\n"
+        "static int lc3_putchar(int ch) { fputc((unsigned char)ch, stdout); return 0; }\n"
+        "static int lc3_puts(const char *s) { fputs(s, stdout); return 0; }\n"
+        "#define getchar lc3_getchar\n"
+        "#define putchar lc3_putchar\n"
+        "#define puts lc3_puts\n"
+    )
+    if case.expected_global is None:
+        return prefix + text
+
+    global_name = case.expected_global[0]
+    return (
+        prefix
+        + "#define main lc3_user_main\n"
+        + text
+        + "\n#undef main\n"
+        + "int main(void) {\n"
+        + "    int rc = lc3_user_main();\n"
+        + f"    printf(\"__GLOBAL__:%u\\n\", (unsigned)((uint16_t){global_name}));\n"
+        + "    return rc;\n"
+        + "}\n"
+    )
+
+
+def run_gcc_case(case: Case) -> None:
+    if shutil.which("gcc") is None:
+        raise TestFailure("gcc not found; local full test requires gcc for oracle comparison")
+
+    source = CASES_DIR / case.source
+    with tempfile.TemporaryDirectory(prefix="compiler-lc3-gcc-") as tmpdir:
+        tmp = Path(tmpdir)
+        wrapped = tmp / source.name
+        elf = tmp / "program.elf"
+        wrapped.write_text(_gcc_source(source, case), encoding="utf-8")
+        run(["gcc", "-std=c11", "-w", "-o", str(elf), str(wrapped)], cwd=ROOT)
+        stdout = run([str(elf)], cwd=ROOT, input_text=case.program_input)
+
+    if case.expected_output is not None:
+        expected = case.expected_output.replace("\r\n", "\n").replace("\r", "\n")
+        actual = stdout.replace("\r\n", "\n").replace("\r", "\n")
+        if actual != expected:
+            raise TestFailure(f"{case.source}: gcc output differs from expected\n  expected: {expected!r}\n  got:      {actual!r}")
+
+    if case.expected_global is not None:
+        match = re.search(r"__GLOBAL__:(\d+)", stdout)
+        if not match:
+            raise TestFailure(f"{case.source}: gcc oracle did not print global marker:\n{stdout}")
+        actual = int(match.group(1))
+        expected = case.expected_global[1] & 0xFFFF
+        if actual != expected:
+            raise TestFailure(
+                f"{case.source}: gcc expected {case.expected_global[0]} = x{expected:04X}, got x{actual:04X}\n{stdout}"
+            )
+
+
 def main() -> int:
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -457,7 +519,25 @@ def main() -> int:
         print(f"\n{failures.__len__()} SIMULATION FAILURE(S)")
         return 1
 
-    print(f"\nALL {len(CASES) + len(BEG_CASES)} TESTS PASSED (golden + simulation)")
+    print("\n=== gcc oracle comparison ===", flush=True)
+    gcc_failures: list[str] = []
+    for case in CASES + BEG_CASES:
+        try:
+            _progress(f"[gcc] {case.source}")
+            run_gcc_case(case)
+        except subprocess.TimeoutExpired as exc:
+            gcc_failures.append(f"{case.source}: gcc timeout after {exc.timeout}s\n{exc}")
+        except Exception as exc:
+            gcc_failures.append(str(exc))
+
+    if gcc_failures:
+        for failure in gcc_failures:
+            print(failure)
+            print("-" * 80)
+        print(f"\n{gcc_failures.__len__()} GCC ORACLE FAILURE(S)")
+        return 1
+
+    print(f"\nALL {len(CASES) + len(BEG_CASES)} TESTS PASSED (golden + simulation + gcc oracle)")
     return 0
 
 

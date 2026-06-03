@@ -139,13 +139,24 @@ BRzp DONE_3          ; if not (i < n), jump
 
 ### 本地完整测试
 
-本地测试会编译所有用例、与 golden 汇编对比、调用 `lc3as` 汇编，并用 `lc3sim` 真实执行检查输出和全局变量。
+本地测试会做三类验证：
+
+1. 编译所有用例，并与 `tests/golden/` 中提交的汇编逐行对比。
+2. 调用 `lc3as` 汇编，并用 `lc3sim` 真实执行检查输出和全局变量。
+3. 用 `gcc` 编译同一份 C 用例生成本机 ELF，作为语义 oracle 对拍期望输出或全局变量值。
 
 ```bash
 python3 tests/run_tests.py
 ```
 
-本地运行依赖仓库内的 `lc3tools/`。如果需要重新构建工具链：
+也可以只运行 GCC oracle：
+
+```bash
+python3 tests/oracle.py
+python3 tests/oracle.py tests/cases/array_loop.c
+```
+
+本地完整测试依赖仓库内的 `lc3tools/` 和系统 `gcc`。如果需要重新构建 LC-3 工具链：
 
 ```bash
 cd lc3tools
@@ -155,18 +166,20 @@ make && make install
 
 ### CI 测试
 
-线上 CI 只做 golden 对比，不运行 LC-3 仿真：
+线上 CI 不运行 LC-3 仿真，执行两项轻量验证：
 
 ```bash
 CI=true python3 tests/run_tests.py
+python3 tests/oracle.py
 ```
 
-这是有意设计：本地已经用真实 LC-3 工具验证行为；GitHub Actions 只需要确认构建环境生成的汇编与本地提交的 golden 文件完全一致。
+其中 `CI=true python3 tests/run_tests.py` 只做 golden 对比，确认构建环境生成的汇编与本地提交的 golden 文件完全一致；`python3 tests/oracle.py` 用 GCC 生成本机 ELF，验证所有注册用例的期望输出或全局变量值。线上仍不启动 `lc3sim`，因为 LC-3 真实执行已经由本地完整测试负责。
 
 当前测试规模：
 
 - 49 个端到端 C 用例
 - 覆盖默认模式、手写者风格、输入输出、数组、指针、复合赋值、乘除模、短路逻辑和调试注释
+- 本地用 GCC ELF 对拍全部注册用例的期望输出或全局变量值
 - 本地额外验证 4 种参数组合：默认、`-d`、`--beginner-style`、`-d --beginner-style`
 
 ### 更新 golden
@@ -189,7 +202,7 @@ git push origin v0.1.0
 
 流程为：
 
-1. Linux 上运行 `CI=true python3 tests/run_tests.py`，只做 golden 对比。
+1. Linux 上运行 `CI=true python3 tests/run_tests.py` 做 golden 对比，并运行 `python3 tests/oracle.py` 做 GCC oracle。
 2. Linux / Windows / macOS 构建 portable 包。
 3. tag 构建成功后上传到 GitHub Releases。
 

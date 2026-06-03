@@ -21,6 +21,9 @@ jobs:
         env:
           CI: "true"
 
+      - name: Run gcc oracle
+        run: python3 tests/oracle.py
+
   build-release:
     needs: test-linux
     strategy:

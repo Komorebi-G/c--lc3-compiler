@@ -2,8 +2,8 @@
 int main() {
     int a = 10;
     int b = 20;
-    int p;
-    int q;
+    int* p;
+    int* q;
     p = &a;
     q = &b;
     *p = *p + *q;  /* a = a + b = 30 */
