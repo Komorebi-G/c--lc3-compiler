@@ -117,6 +117,14 @@ CASES = [
     Case("string_quote_backslash.c", expected_output="Q\"R\\S\n"),
     Case("global_negative_word.c", expected_global=("result", -1)),
     Case("for_step_call_continue.c", expected_output="4\n"),
+    Case("global_char_bool_mix.c", expected_global=("result", 67)),
+    Case("pointer_param_mutation.c", expected_global=("result", 24)),
+    Case("array_partial_init.c", expected_global=("result", 6)),
+    Case("return_without_expr.c", expected_global=("result", 12)),
+    Case("compare_false_matrix.c", expected_global=("result", 63)),
+    Case("array_index_side_effect.c", expected_global=("result", 345)),
+    Case("logical_assignment_short_circuit.c", expected_global=("result", 53)),
+    Case("char_pointer_write.c", expected_output="B\n"),
 ]
 
 BEG_CASES = [
@@ -126,6 +134,7 @@ BEG_CASES = [
     Case("beginner_input_loop.c", expected_output="4\n", program_input="test\n"),
     Case("beginner_multi_func.c", expected_output="8\n"),
     Case("beginner_builtin_leaf.c", expected_output="B6\n"),
+    Case("beginner_array_call_mix.c", expected_output="6\n"),
 ]
 
 

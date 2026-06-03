@@ -735,6 +735,13 @@ class CodeGenerator:
                             if offset is not None:
                                 store_offset = offset + i
                                 self._append_instruction(ctx.lines, f"    STR R0, R5, #{store_offset}", f"{item.name}[{i}] = {self._expr_to_text(init_expr)}")
+                    if not self.beginner_style and len(item.init_list) < item.size:
+                        offset = ctx.var_offsets.get(item.name)
+                        if offset is not None:
+                            self._append_instruction(ctx.lines, "    AND R0, R0, #0", f"zero remaining {item.name} elements")
+                            for i in range(len(item.init_list), item.size):
+                                store_offset = offset + i
+                                self._append_instruction(ctx.lines, f"    STR R0, R5, #{store_offset}", f"{item.name}[{i}] = 0")
                 had_decls = True
                 continue
             if had_decls and self.beginner_style:
