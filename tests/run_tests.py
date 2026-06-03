@@ -7,6 +7,7 @@ import select
 import shutil
 import subprocess
 import sys
+import termios
 import tempfile
 import time
 from dataclasses import dataclass
@@ -32,6 +33,12 @@ class Case:
     expected_global: Optional[tuple[str, int]] = None
     expected_output: Optional[str] = None
     program_input: str = ""
+
+
+@dataclass(frozen=True)
+class ObservedResult:
+    output: Optional[str] = None
+    global_value: Optional[int] = None
 
 
 CASES = [
@@ -230,7 +237,7 @@ def verify_beginner_style_success() -> None:
     shutil.move(generated_sym, BUILD_DIR / generated_sym.name)
 
     output = simulate(obj, commands="file " + str(obj) + "\ncontinue\nquit\n")
-    ensure_output_contains(output, "OK\nA\n")
+    ensure_output_matches(output, "OK\nA\n")
 
 
 def verify_beginner_style_stack_case_runs() -> None:
@@ -271,7 +278,7 @@ def verify_beginner_style_stack_case_runs() -> None:
     shutil.move(generated_sym, BUILD_DIR / generated_sym.name)
 
     output = simulate(obj, commands="file " + str(obj) + "\ncontinue\nquit\n")
-    ensure_output_contains(output, "6\n")
+    ensure_output_matches(output, "6\n")
 
 
 def _simulate_tty(obj: Path, *, commands: str, timeout: int = 20) -> str:
@@ -291,6 +298,13 @@ def _simulate_tty(obj: Path, *, commands: str, timeout: int = 20) -> str:
     if pid == 0:
         os.chdir(LC3TOOLS_DIR)
         os.execv("./lc3sim", ["./lc3sim"])
+
+    try:
+        attrs = termios.tcgetattr(fd)
+        attrs[3] &= ~termios.ECHO
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except termios.error:
+        pass
 
     output: list[str] = []
     deadline = time.monotonic() + timeout
@@ -374,11 +388,73 @@ def extract_global_value(output: str) -> int:
     return int(matches[-1], 16)
 
 
-def ensure_output_contains(output: str, expected: str) -> None:
-    normalized_output = output.replace("\r\n", "\n").replace("\r", "\n")
-    normalized_expected = expected.replace("\r\n", "\n").replace("\r", "\n")
-    if normalized_expected not in normalized_output:
-        raise TestFailure(f"expected program output {expected!r} not found in simulator output:\n{output}")
+def normalize_text(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def extract_program_output(output: str) -> str:
+    text = normalize_text(output)
+    load_match = re.search(r"Loaded .* and set PC to x[0-9A-Fa-f]+\n", text)
+    if not load_match:
+        raise TestFailure(f"could not find loaded-program marker in simulator output:\n{output}")
+
+    halt_marker = "\n--- halting the LC-3 ---"
+    halt_at = text.find(halt_marker, load_match.end())
+    if halt_at < 0:
+        raise TestFailure(f"could not find halt marker in simulator output:\n{output}")
+
+    program = text[load_match.end():halt_at]
+    if program.startswith("(lc3sim) "):
+        program = program[len("(lc3sim) "):]
+    if program.endswith("\n"):
+        program = program[:-1]
+    return program
+
+
+def ensure_output_matches(output: str, expected: str) -> None:
+    actual = extract_program_output(output)
+    normalized_expected = normalize_text(expected)
+    if actual != normalized_expected:
+        raise TestFailure(
+            f"program output differs from expected\n"
+            f"  expected: {normalized_expected!r}\n"
+            f"  got:      {actual!r}\n"
+            f"full simulator output:\n{output}"
+        )
+
+
+def run_lc3_case(case: Case, extra_flags: list[str] | None = None) -> ObservedResult:
+    _, obj = compile_case(case, extra_flags=extra_flags)
+    commands = f"file {obj}\ncontinue\n"
+    commands += case.program_input
+    if case.expected_global is not None:
+        commands += f"translate G_{case.expected_global[0]}\n"
+    commands += "quit\n"
+
+    output = simulate(obj, commands=commands, needs_tty=bool(case.program_input))
+    observed_output: Optional[str] = None
+    observed_global: Optional[int] = None
+
+    if case.expected_output is not None:
+        observed_output = extract_program_output(output)
+        expected = normalize_text(case.expected_output)
+        if observed_output != expected:
+            raise TestFailure(
+                f"{case.source}: LC-3 output differs from expected\n"
+                f"  expected: {expected!r}\n"
+                f"  got:      {observed_output!r}\n"
+                f"full simulator output:\n{output}"
+            )
+
+    if case.expected_global is not None:
+        observed_global = extract_global_value(output)
+        expected = case.expected_global[1] & 0xFFFF
+        if observed_global != expected:
+            raise TestFailure(
+                f"{case.source}: expected G_{case.expected_global[0]} = x{expected:04X}, got x{observed_global:04X}\n{output}"
+            )
+
+    return ObservedResult(output=observed_output, global_value=observed_global)
 
 
 def _gcc_source(source: Path, case: Case) -> str:
@@ -411,7 +487,7 @@ def _gcc_source(source: Path, case: Case) -> str:
     )
 
 
-def run_gcc_case(case: Case) -> None:
+def run_gcc_case(case: Case) -> ObservedResult:
     if shutil.which("gcc") is None:
         raise TestFailure("gcc not found; local full test requires gcc for oracle comparison")
 
@@ -424,22 +500,34 @@ def run_gcc_case(case: Case) -> None:
         run(["gcc", "-std=c11", "-w", "-o", str(elf), str(wrapped)], cwd=ROOT)
         stdout = run([str(elf)], cwd=ROOT, input_text=case.program_input)
 
-    if case.expected_output is not None:
-        expected = case.expected_output.replace("\r\n", "\n").replace("\r", "\n")
-        actual = stdout.replace("\r\n", "\n").replace("\r", "\n")
-        if actual != expected:
-            raise TestFailure(f"{case.source}: gcc output differs from expected\n  expected: {expected!r}\n  got:      {actual!r}")
+    stdout = normalize_text(stdout)
+    observed_global: Optional[int] = None
+    program_output = stdout
 
     if case.expected_global is not None:
-        match = re.search(r"__GLOBAL__:(\d+)", stdout)
+        match = re.search(r"__GLOBAL__:(\d+)\n?", stdout)
         if not match:
             raise TestFailure(f"{case.source}: gcc oracle did not print global marker:\n{stdout}")
-        actual = int(match.group(1))
+        observed_global = int(match.group(1))
+        program_output = stdout[:match.start()] + stdout[match.end():]
         expected = case.expected_global[1] & 0xFFFF
-        if actual != expected:
+        if observed_global != expected:
             raise TestFailure(
-                f"{case.source}: gcc expected {case.expected_global[0]} = x{expected:04X}, got x{actual:04X}\n{stdout}"
+                f"{case.source}: gcc expected {case.expected_global[0]} = x{expected:04X}, got x{observed_global:04X}\n{stdout}"
             )
+
+    observed_output: Optional[str] = None
+    if case.expected_output is not None:
+        observed_output = program_output
+        expected = normalize_text(case.expected_output)
+        if observed_output != expected:
+            raise TestFailure(
+                f"{case.source}: gcc output differs from expected\n"
+                f"  expected: {expected!r}\n"
+                f"  got:      {observed_output!r}"
+            )
+
+    return ObservedResult(output=observed_output, global_value=observed_global)
 
 
 def main() -> int:
@@ -472,26 +560,11 @@ def main() -> int:
     verify_beginner_style_stack_case_runs()
 
     failures: list[str] = []
+    lc3_results: dict[str, ObservedResult] = {}
     for case in CASES:
         try:
             _progress(case.source)
-            _, obj = compile_case(case)
-            commands = f"file {obj}\ncontinue\n"
-            if case.expected_global is not None:
-                commands += f"translate G_{case.expected_global[0]}\n"
-            commands += case.program_input
-            commands += "quit\n"
-            output = simulate(obj, commands=commands, needs_tty=bool(case.program_input))
-
-            if case.expected_global is not None:
-                value = extract_global_value(output)
-                expected = case.expected_global[1] & 0xFFFF
-                if value != expected:
-                    raise TestFailure(
-                        f"{case.source}: expected G_{case.expected_global[0]} = x{expected:04X}, got x{value:04X}\n{output}"
-                    )
-            if case.expected_output is not None:
-                ensure_output_contains(output, case.expected_output)
+            lc3_results[case.source] = run_lc3_case(case)
         except subprocess.TimeoutExpired as exc:
             failures.append(f"{case.source}: timeout after {exc.timeout}s\n{exc}")
         except Exception as exc:
@@ -500,13 +573,7 @@ def main() -> int:
     for case in BEG_CASES:
         try:
             _progress(f"[beginner] {case.source}")
-            _, obj = compile_case(case, extra_flags=["--beginner-style"])
-            commands = f"file {obj}\ncontinue\n"
-            commands += case.program_input
-            commands += "quit\n"
-            output = simulate(obj, commands=commands, needs_tty=bool(case.program_input))
-            if case.expected_output is not None:
-                ensure_output_contains(output, case.expected_output)
+            lc3_results[case.source] = run_lc3_case(case, extra_flags=["--beginner-style"])
         except subprocess.TimeoutExpired as exc:
             failures.append(f"[beginner] {case.source}: timeout after {exc.timeout}s\n{exc}")
         except Exception as exc:
@@ -524,7 +591,14 @@ def main() -> int:
     for case in CASES + BEG_CASES:
         try:
             _progress(f"[gcc] {case.source}")
-            run_gcc_case(case)
+            gcc_result = run_gcc_case(case)
+            lc3_result = lc3_results[case.source]
+            if gcc_result != lc3_result:
+                raise TestFailure(
+                    f"{case.source}: LC-3 result differs from gcc oracle\n"
+                    f"  lc3: {lc3_result}\n"
+                    f"  gcc: {gcc_result}"
+                )
         except subprocess.TimeoutExpired as exc:
             gcc_failures.append(f"{case.source}: gcc timeout after {exc.timeout}s\n{exc}")
         except Exception as exc:
@@ -537,7 +611,7 @@ def main() -> int:
         print(f"\n{gcc_failures.__len__()} GCC ORACLE FAILURE(S)")
         return 1
 
-    print(f"\nALL {len(CASES) + len(BEG_CASES)} TESTS PASSED (golden + simulation + gcc oracle)")
+    print(f"\nALL {len(CASES) + len(BEG_CASES)} TESTS PASSED (golden + LC-3/GCC oracle comparison)")
     return 0
 
 

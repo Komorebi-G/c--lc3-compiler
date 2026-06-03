@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Run registered test cases through the gcc oracle.
 
-The main regression runner already compares compiler-lc3 against the same
-expected behavior through LC-3 simulation.  This helper is useful when you only
-want to check the native C side.
+The main regression runner compares observed LC-3 simulation results directly
+against observed gcc results.  This helper is useful when you only want to
+check the native C side.
 
 Usage:
     python3 tests/oracle.py

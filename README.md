@@ -143,7 +143,7 @@ BRzp DONE_3          ; if not (i < n), jump
 
 1. 编译所有用例，并与 `tests/golden/` 中提交的汇编逐行对比。
 2. 调用 `lc3as` 汇编，并用 `lc3sim` 真实执行检查输出和全局变量。
-3. 用 `gcc` 编译同一份 C 用例生成本机 ELF，作为语义 oracle 对拍期望输出或全局变量值。
+3. 用 `gcc` 编译同一份 C 用例生成本机 ELF，再把 GCC 的实际运行结果与 LC-3 仿真的实际运行结果直接对拍。
 
 ```bash
 python3 tests/run_tests.py
@@ -173,13 +173,13 @@ CI=true python3 tests/run_tests.py
 python3 tests/oracle.py
 ```
 
-其中 `CI=true python3 tests/run_tests.py` 只做 golden 对比，确认构建环境生成的汇编与本地提交的 golden 文件完全一致；`python3 tests/oracle.py` 用 GCC 生成本机 ELF，验证所有注册用例的期望输出或全局变量值。线上仍不启动 `lc3sim`，因为 LC-3 真实执行已经由本地完整测试负责。
+其中 `CI=true python3 tests/run_tests.py` 只做 golden 对比，确认构建环境生成的汇编与本地提交的 golden 文件完全一致；`python3 tests/oracle.py` 用 GCC 生成本机 ELF，验证所有注册用例的期望输出或全局变量值。线上仍不启动 `lc3sim`，因为 LC-3 与 GCC 的真实执行对拍已经由本地完整测试负责。
 
 当前测试规模：
 
 - 49 个端到端 C 用例
 - 覆盖默认模式、手写者风格、输入输出、数组、指针、复合赋值、乘除模、短路逻辑和调试注释
-- 本地用 GCC ELF 对拍全部注册用例的期望输出或全局变量值
+- 本地用 GCC ELF 直接对拍全部注册用例的 LC-3 仿真实际结果
 - 本地额外验证 4 种参数组合：默认、`-d`、`--beginner-style`、`-d --beginner-style`
 
 ### 更新 golden
